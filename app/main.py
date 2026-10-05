@@ -152,6 +152,10 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def as_aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
@@ -170,6 +174,22 @@ def event_payload(event_type: str, payload: dict, correlation_id: str | None = N
 
 def emit(event_type: str, payload: dict, correlation_id: str | None = None, actor: dict | None = None) -> None:
     publish_event(event_type, event_payload(event_type, payload, correlation_id, actor))
+
+
+def emit_shift_status_changed(shift_id: str, previous_status: str, new_status: ShiftStatus, reason: str | None, correlation_id: str) -> None:
+    event = {
+        "event_id": str(uuid4()),
+        "event_type": "operations.shift.status_changed",
+        "schema_version": 1,
+        "occurred_at": utc_iso(utcnow()),
+        "correlation_id": correlation_id,
+        "producer": settings.service_name,
+        "shift_id": shift_id,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "reason": reason,
+    }
+    publish_event("operations.shift.status_changed", event, key=shift_id)
 
 
 def token_hash(token: str) -> str:
@@ -213,16 +233,11 @@ def record_status_change(shift: dict, new_status: ShiftStatus, reason: str | Non
         "reason": reason,
         "actor_user_id": actor_user_id,
         "occurred_at": utcnow(),
-        "correlation_id": f"corr_{uuid4().hex}",
+        "correlation_id": str(uuid4()),
         "metadata": {},
     }
     shift_status_history.append(history_item)
-    emit(
-        "operations.shift.status_changed",
-        {"shiftId": shift["id"], "previousStatus": previous_status, "newStatus": new_status, "reason": reason},
-        history_item["correlation_id"],
-        {"userId": actor_user_id} if actor_user_id else None,
-    )
+    emit_shift_status_changed(shift["id"], previous_status, new_status, reason, history_item["correlation_id"])
     return history_item
 
 

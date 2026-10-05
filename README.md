@@ -42,6 +42,14 @@
 - `Performer` / исполнитель - локальная projection в OMS5, источником является `OMS2.Employee`.
 - `User` / пользователь портала - аккаунт и роли в `OMS1`.
 
+## Границы владения
+
+- `OMS5` владеет клиентами, сменами, performer projection, offer campaigns, assignments, timesheets и FSM смен.
+- `OMS2` владеет master data сотрудников; `OMS5` хранит только локальную projection исполнителя.
+- `OMS1` владеет пользователями, ролями, JWT и связью `user -> employee_id`.
+- `OMS4` владеет шаблонами уведомлений, email delivery и статусами доставки.
+- UI не владеет операционными данными и работает как API client к `OMS5`.
+
 ## Статусы смены
 
 ```text
@@ -58,6 +66,66 @@ A90_ARCHIVE     Архив
 ```
 
 История переходов хранится в `ShiftStatusHistory`.
+
+Разрешенные переходы:
+
+```text
+A00_DRAFT -> A10_CONFIRM
+A10_CONFIRM -> A20_SOURCING
+A20_SOURCING -> A30_CHOICE
+A20_SOURCING -> A80_CLOSED
+A30_CHOICE -> A20_SOURCING
+A30_CHOICE -> A40_EXECUTION
+A30_CHOICE -> A80_CLOSED
+A40_EXECUTION -> A50_VERIFY
+A50_VERIFY -> A60_SETTLE
+A50_VERIFY -> A80_CLOSED
+A60_SETTLE -> A70_CONFIRM
+A70_CONFIRM -> A80_CLOSED
+A80_CLOSED -> A90_ARCHIVE
+```
+
+Для `A80_CLOSED` используются `close_reason`: `paid`, `canceled`, `failed`, `deleted`.
+
+Для неуспешного закрытия используются `failure_reason`: `absence`, `no_performer_found`, `client_rejected`, `timesheet_invalid`, `manual_admin_decision`.
+
+## Reporting period
+
+Отчетный период считается по `shift.starts_at`. Дата закрытия отчетного периода - конец 10-го числа месяца, следующего за месяцем `shift.starts_at`.
+
+Если отчетный период уже закрыт, создание смены задним числом отклоняется с `409 reporting_period_closed`.
+
+Для незаполненных смен в статусе `A20_SOURCING` есть internal endpoint авто-закрытия:
+
+```http
+POST /internal/shifts/auto-close-unfilled
+```
+
+Он переводит подходящие смены в `A80_CLOSED` с `close_reason=failed`, `failure_reason=no_performer_found`, `auto_closed=true`.
+
+## Offers
+
+Одна смена имеет одного назначенного исполнителя. Предлагать смену можно нескольким исполнителям через offer campaign.
+
+MVP-правило выбора исполнителя:
+
+```text
+first accepted wins
+```
+
+Правила public token endpoints:
+
+- `GET /public/shift-offers/{token}` только показывает данные.
+- `POST /public/shift-offers/{token}/viewed` логирует каждый просмотр, даже если offer уже недоступен.
+- `POST /public/shift-offers/{token}/accept` является transactional command в рамках текущей реализации.
+- Если смена уже занята, второй исполнитель получает `409 offer_lost`.
+- `POST /public/shift-offers/{token}/decline` публикует событие отказа.
+
+## Интеграция Kafka и RabbitMQ
+
+Kafka используется для domain/integration events `operations.*`.
+
+RabbitMQ используется как shared command queue для команд фоновой обработки в соседних сервисах. OMS5 не выполняет email/report jobs напрямую: уведомления должны идти через `OMS4`, построение отчетов - через `OMS3`.
 
 ## API
 
@@ -230,6 +298,27 @@ GET /operations/summary
 - `operations.timesheet.submitted` - табель отправлен.
 - `operations.shift.closed` - смена закрыта.
 
+### `operations.shift.status_changed`
+
+`OMS5` публикует событие после каждого успешного валидного перехода статуса смены. Kafka key сообщения: `shift_id`.
+
+```json
+{
+  "event_id": "uuid",
+  "event_type": "operations.shift.status_changed",
+  "schema_version": 1,
+  "occurred_at": "2026-10-05T12:00:00Z",
+  "correlation_id": "uuid",
+  "producer": "OMS5",
+  "shift_id": "uuid",
+  "previous_status": "A20_SOURCING",
+  "new_status": "A30_CHOICE",
+  "reason": "performer_assigned"
+}
+```
+
+Consumer-ы должны выполнять идемпотентность по `event_id`. `OMS3` помечает report cache смены как stale. `OMS4` принимает решение о необходимости уведомления.
+
 ## Переменные окружения
 
 | Переменная | Значение по умолчанию | Назначение |
@@ -293,13 +382,3 @@ kubectl -n oms port-forward svc/oms5 8005:80
 ```text
 http://localhost:8005/docs
 ```
-
-## Важно для production
-
-- Сейчас используется in-memory хранилище, данные теряются при рестарте.
-- Нужно добавить БД, миграции и полноценные CRUD-операции.
-- Нужно реализовать Kafka consumer для `employee.created`, `employee.updated`, `employee.deactivated`.
-- Нужно добавить авторизацию через `OMS1`.
-- Нужно вынести public offer pages в `oms-portal-ui`.
-- Нужно добавить RabbitMQ-backed lightweight workers для report/email commands.
-- Для табеля нужно добавить бизнес-правила: пересечения смен, лимиты часов, статусы согласования.
