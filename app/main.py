@@ -1,13 +1,14 @@
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from hashlib import sha256
+import logging
 from secrets import token_urlsafe
 from threading import Lock
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from app.healthcheck.router import router as healthcheck_router
 from app.kafka import publish_event
@@ -22,6 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(healthcheck_router)
+logger = logging.getLogger(settings.service_name)
 
 clients: dict[str, dict] = {}
 performers: dict[str, dict] = {}
@@ -134,6 +136,24 @@ class ShiftTransition(BaseModel):
     actor_user_id: str | None = None
     close_reason: CloseReason | None = None
     failure_reason: FailureReason | None = None
+
+
+class InternalShiftRead(BaseModel):
+    id: str
+    client_id: str
+    starts_at: datetime
+    ends_at: datetime
+    status: str
+    location: str | None = None
+    assigned_performer_id: str | None = None
+    close_reason: str | None = None
+    failure_reason: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("starts_at", "ends_at", "created_at", "updated_at")
+    def serialize_datetime(self, value: datetime) -> str:
+        return utc_iso(as_aware(value))
 
 
 class OfferCampaignCreate(BaseModel):
@@ -456,6 +476,33 @@ def create_timesheet(payload: TimesheetCreate) -> dict:
     timesheets[item["id"]] = item
     emit("operations.timesheet.submitted", item)
     return item
+
+
+@app.get("/internal/shifts", response_model=list[InternalShiftRead])
+def list_internal_shifts(
+    starts_at_from: datetime = Query(alias="startsAtFrom"),
+    starts_at_to: datetime = Query(alias="startsAtTo"),
+) -> list[dict]:
+    starts_at_from = as_aware(starts_at_from).astimezone(timezone.utc)
+    starts_at_to = as_aware(starts_at_to).astimezone(timezone.utc)
+    if starts_at_to < starts_at_from:
+        logger.warning("Invalid internal shifts period", extra={"startsAtFrom": utc_iso(starts_at_from), "startsAtTo": utc_iso(starts_at_to), "error_code": "invalid_period"})
+        raise HTTPException(status_code=422, detail={"code": "invalid_period", "message": "startsAtTo must be greater than or equal to startsAtFrom"})
+    if starts_at_to - starts_at_from > timedelta(days=366):
+        logger.warning("Internal shifts period is too large", extra={"startsAtFrom": utc_iso(starts_at_from), "startsAtTo": utc_iso(starts_at_to), "error_code": "period_too_large"})
+        raise HTTPException(status_code=422, detail={"code": "period_too_large", "message": "Period must not exceed 366 calendar days"})
+
+    result = [
+        shift
+        for shift in shifts.values()
+        if starts_at_from <= as_aware(shift["starts_at"]).astimezone(timezone.utc) <= starts_at_to
+    ]
+    result.sort(key=lambda shift: (as_aware(shift["starts_at"]).astimezone(timezone.utc), shift["id"]))
+    logger.info(
+        "Listed internal shifts",
+        extra={"startsAtFrom": utc_iso(starts_at_from), "startsAtTo": utc_iso(starts_at_to), "count": len(result)},
+    )
+    return result
 
 
 @app.post("/internal/shifts/auto-close-unfilled")

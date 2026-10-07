@@ -103,6 +103,14 @@ POST /internal/shifts/auto-close-unfilled
 
 Он переводит подходящие смены в `A80_CLOSED` с `close_reason=failed`, `failure_reason=no_performer_found`, `auto_closed=true`.
 
+Для отчетов OMS3 есть read-only internal endpoint выборки смен по `starts_at`:
+
+```http
+GET /internal/shifts?startsAtFrom=2026-10-01T00:00:00Z&startsAtTo=2026-10-31T23:59:59Z
+```
+
+Endpoint возвращает смены внутри периода, отсортированные по `starts_at`, затем по `id`, и не публикует Kafka events.
+
 ## Offers
 
 Одна смена имеет одного назначенного исполнителя. Предлагать смену можно нескольким исполнителям через offer campaign.
@@ -259,6 +267,32 @@ Content-Type: application/json
   "work_date": "2026-01-20",
   "hours": 8
 }
+```
+
+### Получить смены для internal отчетов
+
+```http
+GET /internal/shifts?startsAtFrom=2026-10-01T00:00:00Z&startsAtTo=2026-10-31T23:59:59Z
+```
+
+Ответ:
+
+```json
+[
+  {
+    "id": "shift-uuid",
+    "client_id": "client-uuid",
+    "starts_at": "2026-10-05T09:00:00Z",
+    "ends_at": "2026-10-05T18:00:00Z",
+    "status": "A30_CHOICE",
+    "location": "Москва",
+    "assigned_performer_id": null,
+    "close_reason": null,
+    "failure_reason": null,
+    "created_at": "2026-10-01T12:00:00Z",
+    "updated_at": "2026-10-05T12:00:00Z"
+  }
+]
 ```
 
 ### Получить сводку
