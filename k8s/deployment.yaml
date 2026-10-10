@@ -22,6 +22,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: oms5-config
+            - secretRef:
+                name: oms5-secret
+                optional: true
           readinessProbe:
             httpGet:
               path: /health/ready

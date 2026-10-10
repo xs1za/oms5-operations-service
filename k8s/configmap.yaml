@@ -7,3 +7,5 @@ data:
   SERVICE_NAME: OMS5
   ROOT_PATH: /oms5
   KAFKA_BOOTSTRAP_SERVERS: kafka.oms.svc.cluster.local:9092
+  OMS1_AUTH_BASE_URL: http://oms1.oms.svc.cluster.local
+  SERVICE_CLIENT_ID: OMS5
