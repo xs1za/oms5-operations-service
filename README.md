@@ -32,7 +32,8 @@
 - Python 3.11
 - FastAPI
 - Uvicorn
-- in-memory хранилище для стартового прототипа
+- PostgreSQL для постоянного операционного состояния
+- SQL-миграции и транзакции PostgreSQL
 - confluent-kafka
 
 ## Термины
@@ -315,6 +316,23 @@ GET /operations/summary
 }
 ```
 
+## PostgreSQL
+
+Операционное состояние OMS5 хранится в PostgreSQL. При старте приложения выполняется идемпотентная миграция:
+
+```text
+app/migrations/001_create_operational_state.sql
+```
+
+Подключение задается переменной `DATABASE_URL`. В Kubernetes она передается через Secret. Для локального запуска:
+
+```powershell
+$env:DATABASE_URL = "postgresql://oms5:oms5@localhost:5435/oms5"
+uvicorn app.main:app --host 0.0.0.0 --port 8005
+```
+
+Принятие предложения выполняется в транзакции PostgreSQL с блокировкой строки смены. Это обеспечивает правило `first accepted wins` при запросах из разных экземпляров OMS5. При недоступности PostgreSQL in-memory fallback не используется.
+
 ## Kafka events
 
 - `operations.client_created` - создан клиент.
@@ -359,6 +377,7 @@ Consumer-ы должны выполнять идемпотентность по 
 | --- | --- | --- |
 | `SERVICE_NAME` | `OMS5` | Имя сервиса |
 | `KAFKA_BOOTSTRAP_SERVERS` | `kafka.oms.svc.cluster.local:9092` | Kafka bootstrap servers |
+| `DATABASE_URL` | `postgresql://oms5:oms5@oms5-postgres:5432/oms5` | PostgreSQL connection string; в Kubernetes передается через Secret |
 
 ## Локальный запуск
 

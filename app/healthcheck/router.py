@@ -5,6 +5,7 @@ from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
 from app.settings import settings
+from app.storage import storage
 
 router = APIRouter(prefix="/health", tags=["healthcheck"])
 
@@ -38,7 +39,11 @@ def live() -> dict:
 @router.get("/ready/")
 @router.get("/ready")
 def ready() -> JSONResponse:
-    checks = {"kafka": check_tcp_endpoint(settings.kafka_bootstrap_servers)}
+    database = storage.check()
+    checks = {
+        "kafka": check_tcp_endpoint(settings.kafka_bootstrap_servers),
+        "database": database,
+    }
     ready_status = "ok" if all(check["status"] == "ok" for check in checks.values()) else "failed"
     return JSONResponse(
         status_code=status.HTTP_200_OK if ready_status == "ok" else status.HTTP_503_SERVICE_UNAVAILABLE,

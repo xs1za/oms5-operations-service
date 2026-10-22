@@ -24,7 +24,7 @@ spec:
                 name: oms5-config
             - secretRef:
                 name: oms5-secret
-                optional: true
+                optional: false
           readinessProbe:
             httpGet:
               path: /health/ready
