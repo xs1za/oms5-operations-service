@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     oms1_auth_base_url: str = "http://oms1.oms.svc.cluster.local"
     service_client_id: str = "OMS5"
     service_client_secret: str = ""
+    database_url: str = "postgresql://oms5:oms5@oms5-postgres:5432/oms5"
 
 
 settings = Settings()
