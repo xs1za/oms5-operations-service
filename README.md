@@ -214,27 +214,16 @@ OMS5 получает профиль из topic people.performer.v1. POST /perfo
 }
 ```
 
-<<<<<<< Updated upstream
-Поля `engagement_type`, `engagement_type_validation_status`, `funnel_stage`, `medical_book_status` и `completed_shifts_count` необязательны для совместимости с записями, созданными до миграции `002`. Значения проверяются по допустимым перечислениям.
-
-### Прочитать исполнителя
-=======
 Поля проекции nullable для старых записей. Прочитать профиль можно по person_id или performer_id:
->>>>>>> Stashed changes
 
 ```http
 GET /performers/by-person/{person_id}
 GET /performers/{performer_id}
 ```
 
-<<<<<<< Updated upstream
-Ответ содержит проекцию воронки: `engagement_type`, `engagement_type_validation_status`, `funnel_stage`, `medical_book_status`, `completed_shifts_count`, `first_booked_at`, `first_shift_completed_at`, `fifth_shift_completed_at`.
-
-=======
->>>>>>> Stashed changes
 ### Создать кампанию предложений смены
 
-Смена должна быть в статусе `A20_SOURCING`. Предложения создаются только исполнителям с подтверждённым типом оформления и готовой стадией воронки. Если хотя бы один исполнитель не прошёл проверку, возвращается `409 performer_not_ready`, а кампания и предложения не создаются.
+Смена должна быть в статусе `A20_SOURCING`.
 
 ```http
 POST /shifts/{shiftId}/offer-campaigns
@@ -262,22 +251,7 @@ POST /public/shift-offers/{token}/accept
 POST /public/shift-offers/{token}/decline
 ```
 
-<<<<<<< Updated upstream
-`POST /viewed` логирует каждый просмотр, даже если offer уже недоступен. `POST /accept` является transactional command: если смена уже занята, второй исполнитель получает `409 offer_lost`. Ответ `accept` содержит снимок типа оформления `assignment.engagement_type` и не раскрывает `token_hash` и `responded_at`.
-
-### Факты воронки и outbox
-
-OMS5 публикует факты для OMS2 в topic `operations.performer.v1` с ключом `person_id`:
-
-- `operations.shift.assigned` — принятие предложения;
-- `operations.shift.completed` — переход смены в `A60_SETTLE` или в `A80_CLOSED` с `close_reason=paid`.
-
-Факт пишется в `operations_outbox` в той же транзакции, что и изменение назначения или смены. Фоновый publisher выбирает неопубликованные строки через `FOR UPDATE SKIP LOCKED`, публикует их и заполняет `published_at`. При недоступной Kafka строка остаётся в outbox, увеличивается `attempts` и заполняется `last_error`; после восстановления Kafka факт публикуется без повторного HTTP-запроса. Publisher использует `enable.idempotence=true` и `acks=all`.
-
-`operations.shift.performer_assigned` сохраняется для обратной совместимости и не заменяет новые факты.
-=======
 Accept возвращает снимок assignment.engagement_type. Публичный ответ не содержит token_hash и responded_at.
->>>>>>> Stashed changes
 
 ### Создать табельную запись
 
@@ -352,8 +326,6 @@ app/migrations/001_create_operational_state.sql
 app/migrations/002_performer_funnel_and_outbox.sql
 ```
 
-Применённые версии фиксируются в `schema_migrations`.
-
 Подключение задается переменной `DATABASE_URL`. В Kubernetes она передается через Secret. Для локального запуска:
 
 ```powershell
@@ -409,13 +381,8 @@ Consumer-ы должны выполнять идемпотентность по 
 | `SERVICE_NAME` | `OMS5` | Имя сервиса |
 | `KAFKA_BOOTSTRAP_SERVERS` | `kafka.oms.svc.cluster.local:9092` | Kafka bootstrap servers |
 | `DATABASE_URL` | `postgresql://oms5:oms5@oms5-postgres:5432/oms5` | PostgreSQL connection string; в Kubernetes передается через Secret |
-<<<<<<< Updated upstream
-| `ENABLE_FUNNEL_OUTBOX` | `true` | Запуск фонового publisher-а outbox; `0`, `false`, `no` отключают поток |
-| `FUNNEL_OUTBOX_BATCH_SIZE` | `100` | Размер пакета публикации outbox |
-=======
 | `ENABLE_FUNNEL_OUTBOX` | `true` | Включает фоновый publisher; `0`, `false` и `no` отключают его |
 | `FUNNEL_OUTBOX_BATCH_SIZE` | `100` | Размер пакета outbox |
->>>>>>> Stashed changes
 | `FUNNEL_OUTBOX_POLL_INTERVAL` | `1.0` | Интервал опроса outbox в секундах |
 
 ## Локальный запуск
