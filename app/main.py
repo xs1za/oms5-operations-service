@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 from threading import Thread
 
 from app.auth import OPS_ROLES, principal_person_id, require_operator, require_principal, require_service_token
+from app.funnel_outbox import enqueue_fact, funnel_outbox_enabled, run_funnel_outbox
 from app.healthcheck.router import router as healthcheck_router
 from app.kafka import publish_event
 from app.person_consumer import run_person_consumer
@@ -91,6 +92,42 @@ ALLOWED_TRANSITIONS = {
     ShiftStatus.ARCHIVE: set(),
 }
 
+ENGAGEMENT_TYPES = {"gph", "self_employed"}
+ENGAGEMENT_VALIDATION_STATUSES = {"pending", "verified", "rejected"}
+MEDICAL_BOOK_STATUSES = {"none", "non_food", "food"}
+FUNNEL_STAGES = {
+    "PERFORMER_BLANK",
+    "PERFORMER_PROFILE",
+    "PERFORMER_DOCS_PENDING",
+    "PERFORMER_READY_NON_MEDICAL",
+    "PERFORMER_READY_NON_FOOD",
+    "PERFORMER_READY_FOOD",
+    "PERFORMER_BOOKED_SHIFT",
+    "PERFORMER_FIRST_SHIFT_COMPLETED",
+    "PERFORMER_FIFTH_SHIFT_COMPLETED",
+    "PERFORMER_PROFILE_DELETED",
+}
+READY_FUNNEL_STAGES = {
+    "PERFORMER_READY_NON_MEDICAL",
+    "PERFORMER_READY_NON_FOOD",
+    "PERFORMER_READY_FOOD",
+    "PERFORMER_BOOKED_SHIFT",
+    "PERFORMER_FIRST_SHIFT_COMPLETED",
+    "PERFORMER_FIFTH_SHIFT_COMPLETED",
+}
+PUBLIC_OFFER_HIDDEN_FIELDS = {"token_hash", "responded_at"}
+PUBLIC_PERFORMER_HIDDEN_FIELDS = {
+    "engagement_type_validation_status",
+    "funnel_stage",
+    "completed_shifts_count",
+    "first_booked_at",
+    "first_shift_completed_at",
+    "fifth_shift_completed_at",
+    "source_version",
+    "synced_at",
+    "merged_into_performer_id",
+}
+
 
 class ClientCreate(BaseModel):
     name: str
@@ -137,6 +174,14 @@ class PerformerSync(BaseModel):
     phone: str | None = None
     status: str = "active"
     source_version: int = Field(ge=1)
+    engagement_type: str | None = None
+    engagement_type_validation_status: str | None = None
+    funnel_stage: str | None = None
+    medical_book_status: str | None = None
+    completed_shifts_count: int = Field(default=0, ge=0)
+    first_booked_at: datetime | None = None
+    first_shift_completed_at: datetime | None = None
+    fifth_shift_completed_at: datetime | None = None
 
     # Legacy field kept only for the staged deployment window; person_id wins.
     employee_id: str | None = None
@@ -157,6 +202,34 @@ class PerformerSync(BaseModel):
     def validate_status(cls, value: str) -> str:
         if value not in {"active", "inactive"}:
             raise ValueError("status must be active or inactive")
+        return value
+
+    @field_validator("engagement_type")
+    @classmethod
+    def validate_engagement_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in ENGAGEMENT_TYPES:
+            raise ValueError("engagement_type must be gph or self_employed")
+        return value
+
+    @field_validator("engagement_type_validation_status")
+    @classmethod
+    def validate_engagement_validation_status(cls, value: str | None) -> str | None:
+        if value is not None and value not in ENGAGEMENT_VALIDATION_STATUSES:
+            raise ValueError("engagement_type_validation_status must be pending, verified or rejected")
+        return value
+
+    @field_validator("funnel_stage")
+    @classmethod
+    def validate_funnel_stage(cls, value: str | None) -> str | None:
+        if value is not None and value not in FUNNEL_STAGES:
+            raise ValueError("funnel_stage is unknown")
+        return value
+
+    @field_validator("medical_book_status")
+    @classmethod
+    def validate_medical_book_status(cls, value: str | None) -> str | None:
+        if value is not None and value not in MEDICAL_BOOK_STATUSES:
+            raise ValueError("medical_book_status must be none, non_food or food")
         return value
 
 
@@ -257,6 +330,8 @@ def initialize_database() -> None:
     storage.migrate()
     if os.environ.get("ENABLE_PERSON_CONSUMER", "true").lower() not in {"0", "false", "no"}:
         Thread(target=run_person_consumer, daemon=True).start()
+    if funnel_outbox_enabled():
+        Thread(target=run_funnel_outbox, daemon=True).start()
 
 
 def utcnow() -> datetime:
@@ -319,7 +394,64 @@ def _performer_response(item: dict) -> dict:
         "status": item.get("status"),
         "source_version": item.get("source_version"),
         "synced_at": utc_iso(as_aware(item["synced_at"])),
+        "engagement_type": item.get("engagement_type"),
+        "engagement_type_validation_status": item.get("engagement_type_validation_status"),
+        "funnel_stage": item.get("funnel_stage"),
+        "medical_book_status": item.get("medical_book_status"),
+        "completed_shifts_count": item.get("completed_shifts_count") or 0,
+        "first_booked_at": _optional_utc_iso(item.get("first_booked_at")),
+        "first_shift_completed_at": _optional_utc_iso(item.get("first_shift_completed_at")),
+        "fifth_shift_completed_at": _optional_utc_iso(item.get("fifth_shift_completed_at")),
+        "merged_into_performer_id": item.get("merged_into_performer_id"),
     }
+
+
+def _optional_utc_iso(value: datetime | None) -> str | None:
+    return utc_iso(as_aware(value)) if value is not None else None
+
+
+def _public_offer_response(offer: dict) -> dict:
+    result = {key: value for key, value in offer.items() if key not in PUBLIC_OFFER_HIDDEN_FIELDS}
+    result["expires_at"] = utc_iso(as_aware(result["expires_at"]))
+    result["sent_at"] = utc_iso(as_aware(result["sent_at"]))
+    return result
+
+
+def _public_performer_response(performer: dict) -> dict:
+    result = {key: value for key, value in performer.items() if key not in PUBLIC_PERFORMER_HIDDEN_FIELDS}
+    result["person_id"] = _person_id_str(result.get("person_id"))
+    return result
+
+
+def _assignment_response(assignment: dict) -> dict:
+    return {
+        "id": assignment["id"],
+        "shift_id": assignment["shift_id"],
+        "performer_id": assignment["performer_id"],
+        "status": assignment["status"],
+        "engagement_type": assignment.get("engagement_type"),
+        "assigned_at": _optional_utc_iso(assignment.get("assigned_at")),
+    }
+
+
+def performer_readiness_reasons(performer: dict) -> list[str]:
+    reasons: list[str] = []
+    if not performer.get("engagement_type"):
+        reasons.append("engagement_type_missing")
+    if performer.get("engagement_type_validation_status") != "verified":
+        reasons.append("engagement_type_not_verified")
+    funnel_stage = performer.get("funnel_stage")
+    if not funnel_stage:
+        reasons.append("funnel_stage_missing")
+    elif funnel_stage not in READY_FUNNEL_STAGES:
+        reasons.append("funnel_stage_not_ready")
+    return reasons
+
+
+def creates_completion_fact(new_status: ShiftStatus | str, close_reason: CloseReason | str | None) -> bool:
+    if str(new_status) == ShiftStatus.SETTLE:
+        return True
+    return str(new_status) == ShiftStatus.CLOSED and str(close_reason) == CloseReason.PAID
 
 
 def event_payload(event_type: str, payload: dict, correlation_id: str | None = None, actor: dict | None = None) -> dict:
@@ -481,10 +613,38 @@ def sync_performer(payload: PerformerSync, _: None = Depends(require_service_tok
         "status": payload.status,
         "source_version": payload.source_version,
         "synced_at": utcnow(),
+        "engagement_type": payload.engagement_type,
+        "engagement_type_validation_status": payload.engagement_type_validation_status,
+        "funnel_stage": payload.funnel_stage,
+        "medical_book_status": payload.medical_book_status,
+        "completed_shifts_count": payload.completed_shifts_count,
+        "first_booked_at": payload.first_booked_at,
+        "first_shift_completed_at": payload.first_shift_completed_at,
+        "fifth_shift_completed_at": payload.fifth_shift_completed_at,
     }
     item = storage.sync_performer(item, created=existing is None)
     emit("operations.performer.created" if existing is None else "operations.performer.updated", item)
     return _performer_response(item)
+
+
+@app.get("/performers/by-person/{person_id}")
+def get_performer_by_person(person_id: str) -> dict:
+    try:
+        resolved = int(person_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail={"code": "validation_error", "message": "person_id must be a decimal BIGINT string"}) from None
+    performer = storage.get_performer_by_person_id(resolved)
+    if performer is None:
+        raise HTTPException(status_code=404, detail={"code": "performer_not_found"})
+    return _performer_response(performer)
+
+
+@app.get("/performers/{performer_id}")
+def get_performer(performer_id: str) -> dict:
+    performer = storage.get_performer(performer_id)
+    if performer is None:
+        raise HTTPException(status_code=404, detail={"code": "performer_not_found"})
+    return _performer_response(performer)
 
 
 @app.post("/shifts", status_code=status.HTTP_201_CREATED)
@@ -538,6 +698,10 @@ def transition_shift(shift_id: str, payload: ShiftTransition, principal: dict = 
         if shift is None:
             raise HTTPException(status_code=404, detail="Shift not found")
         history = make_history(shift, payload.new_status, payload.reason, actor_user_id, actor_person_id, actor_display_name)
+        if creates_completion_fact(payload.new_status, payload.close_reason):
+            fact = storage.prepare_shift_completion(connection, shift, history["occurred_at"])
+            if fact is not None:
+                enqueue_fact(connection, **fact)
         shift["status"] = payload.new_status
         shift["updated_at"] = utcnow()
         if payload.new_status == ShiftStatus.CLOSED:
@@ -579,6 +743,18 @@ def create_offer_campaign(shift_id: str, payload: OfferCampaignCreate, principal
             raise HTTPException(status_code=409, detail={"code": "performer_inactive", "message": "Performer profile is not active"})
         if actor_person_id is not None and performer.get("person_id") == actor_person_id:
             raise HTTPException(status_code=409, detail={"code": "self_assignment_not_allowed", "message": "An operator cannot assign themselves to a shift"})
+        reasons = performer_readiness_reasons(performer)
+        if reasons:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "performer_not_ready",
+                    "message": "Performer is not ready for offers",
+                    "performer_id": performer["id"],
+                    "person_id": _person_id_str(performer.get("person_id")),
+                    "reasons": reasons,
+                },
+            )
 
     campaign = {
         "id": str(uuid4()),
@@ -611,7 +787,12 @@ def create_offer_campaign(shift_id: str, payload: OfferCampaignCreate, principal
 @app.get("/public/shift-offers/{token}")
 def get_public_offer(token: str) -> dict:
     offer, shift, performer = get_offer_context_or_404(token)
-    return {"offer": offer, "shift": shift, "performer": performer, **offer_availability(offer, shift)}
+    return {
+        "offer": _public_offer_response(offer),
+        "shift": shift,
+        "performer": _public_performer_response(performer),
+        **offer_availability(offer, shift),
+    }
 
 
 @app.post("/public/shift-offers/{token}/viewed")
@@ -640,12 +821,15 @@ def accept_offer(token: str) -> dict:
         reason = result.get("reason")
         if result["shift"].get("assigned_performer_id"):
             raise HTTPException(status_code=409, detail={"code": "offer_lost", "message": "Shift already assigned"})
+        if reason == "performer_not_ready":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "performer_not_ready", "message": "Performer is not ready for offers"},
+            )
         raise HTTPException(status_code=409, detail={"code": reason or "offer_unavailable"})
 
     accepted_offer = result["offer"]
     assigned_shift = result["shift"]
-    assigned_shift["assigned_performer_person_id"] = offer.get("performer_person_id") or storage.get_performer(offer["performer_id"]).get("person_id")
-    storage.update_shift_fields(assigned_shift["id"], {"assigned_performer_person_id": assigned_shift["assigned_performer_person_id"]})
     for other_offer in result.get("lost_offers", []):
         emit("operations.shift.offer_lost", {"shiftId": assigned_shift["id"], "offerId": other_offer["id"], "performerId": other_offer["performer_id"]})
     emit_shift_status_changed(
@@ -654,7 +838,11 @@ def accept_offer(token: str) -> dict:
     )
     emit("operations.shift.offer_won", {"shiftId": assigned_shift["id"], "offerId": accepted_offer["id"], "performerId": accepted_offer["performer_id"]})
     emit("operations.shift.performer_assigned", {"shiftId": assigned_shift["id"], "assignmentId": assignment["id"], "performerId": assignment["performer_id"]})
-    return {"offer": accepted_offer, "assignment": assignment, "shift": assigned_shift}
+    return {
+        "offer": {"id": accepted_offer["id"], "status": accepted_offer["status"]},
+        "assignment": _assignment_response(result["assignment"]),
+        "shift": _serialize_shift_author(assigned_shift),
+    }
 
 
 @app.post("/public/shift-offers/{token}/decline")
@@ -665,7 +853,7 @@ def decline_offer(token: str) -> dict:
         raise HTTPException(status_code=404, detail={"code": "offer_token_not_found"}) from None
     if changed:
         emit("operations.shift.offer_declined", {"shiftId": offer["shift_id"], "offerId": offer["id"], "performerId": offer["performer_id"]})
-    return {"offer": offer, "shift": shift}
+    return {"offer": _public_offer_response(offer), "shift": shift}
 
 
 @app.post("/timesheets")

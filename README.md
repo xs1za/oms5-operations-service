@@ -16,16 +16,11 @@
 
 ## Функции
 
-- Создание клиента.
-- Создание смены по клиенту.
-- Ведение FSM смены: `A00_DRAFT` -> `A90_ARCHIVE`.
-- Синхронизация projection исполнителей из `OMS2.Employee`.
-- Создание offer campaign и предложений смен исполнителям.
-- Public token endpoints для `viewed`, `accept`, `decline`.
-- Назначение первого откликнувшегося исполнителя на смену.
-- Создание табельной записи по исполнителю и смене.
-- Получение краткой сводки по операционным данным.
-- Публикация доменных событий в Kafka.
+- Клиенты, смены и FSM смен.
+- Проекция профиля исполнителя из OMS2: тип оформления, подтверждение, стадия и счётчик смен.
+- Предложения только исполнителям с подтверждённым типом и готовой стадией.
+- Транзакционный outbox публикует факты назначения и завершения в Kafka с повторной отправкой.
+- Табели и сводка по операционным данным.
 
 ## Технологии
 
@@ -38,18 +33,16 @@
 
 ## Термины
 
-- `Shift` / смена - центральная бизнес-сущность OMS5.
-- `Task` / задание - устаревший термин, больше не используется.
-- `Performer` / исполнитель - локальная projection в OMS5, источником является `OMS2.Employee`.
-- `User` / пользователь портала - аккаунт и роли в `OMS1`.
+- Shift / смена - центральная бизнес-сущность OMS5.
+- Performer / исполнитель - локальная проекция профиля исполнителя из OMS2.
+- User / пользователь портала - аккаунт и роли в OMS1.
 
 ## Границы владения
 
-- `OMS5` владеет клиентами, сменами, performer projection, offer campaigns, assignments, timesheets и FSM смен.
-- `OMS2` владеет master data сотрудников; `OMS5` хранит только локальную projection исполнителя.
-- `OMS1` владеет пользователями, ролями, JWT и связью `user -> employee_id`.
-- `OMS4` владеет шаблонами уведомлений, email delivery и статусами доставки.
-- UI не владеет операционными данными и работает как API client к `OMS5`.
+- OMS5 владеет клиентами, сменами, проекцией исполнителя, предложениями, назначениями, табелями и FSM смен.
+- OMS2 владеет профилем исполнителя и персональными данными; OMS5 хранит операционную проекцию.
+- OMS1 владеет учетными записями, ролями, JWT и связью user -> person_id.
+- OMS4 владеет шаблонами уведомлений и доставкой email.
 
 ## Статусы смены
 
@@ -132,9 +125,11 @@ first accepted wins
 
 ## Интеграция Kafka и RabbitMQ
 
-Kafka используется для domain/integration events `operations.*`.
+Kafka передает доменные события operations.*. Факты воронки публикуются в operations.performer.v1 с ключом person_id через транзакционный outbox. Publisher повторяет отправку после сбоя Kafka.
 
-RabbitMQ используется как shared command queue для команд фоновой обработки в соседних сервисах. OMS5 не выполняет email/report jobs напрямую: уведомления должны идти через `OMS4`, построение отчетов - через `OMS3`.
+Факт назначения создается при accept. Факт завершения создается при переходе в A60_SETTLE или A80_CLOSED с close_reason=paid. Факт содержит часы и данные табеля. Событие operations.shift.performer_assigned сохранено для совместимости.
+
+RabbitMQ служит очередью фоновых команд соседних сервисов. OMS5 не выполняет email и report jobs напрямую.
 
 ## API
 
@@ -201,27 +196,45 @@ Content-Type: application/json
 
 ### Синхронизировать исполнителя
 
-Endpoint имитирует consumer `employee.created` / `employee.updated` до реализации полноценного Kafka consumer.
+OMS5 получает профиль из topic people.performer.v1. POST /performers/sync оставлен для внутренней синхронизации.
 
-```http
-POST /performers/sync
-Content-Type: application/json
-```
+Пример тела:
 
 ```json
 {
-  "employee_id": 1,
+  "person_id": "1042",
   "display_name": "Иванов Иван",
-  "email": "performer@example.com",
-  "phone": "+79990000000",
   "status": "active",
-  "source_version": 1
+  "source_version": 1,
+  "engagement_type": "self_employed",
+  "engagement_type_validation_status": "verified",
+  "funnel_stage": "PERFORMER_READY_FOOD",
+  "medical_book_status": "food",
+  "completed_shifts_count": 0
 }
 ```
 
+<<<<<<< Updated upstream
+Поля `engagement_type`, `engagement_type_validation_status`, `funnel_stage`, `medical_book_status` и `completed_shifts_count` необязательны для совместимости с записями, созданными до миграции `002`. Значения проверяются по допустимым перечислениям.
+
+### Прочитать исполнителя
+=======
+Поля проекции nullable для старых записей. Прочитать профиль можно по person_id или performer_id:
+>>>>>>> Stashed changes
+
+```http
+GET /performers/by-person/{person_id}
+GET /performers/{performer_id}
+```
+
+<<<<<<< Updated upstream
+Ответ содержит проекцию воронки: `engagement_type`, `engagement_type_validation_status`, `funnel_stage`, `medical_book_status`, `completed_shifts_count`, `first_booked_at`, `first_shift_completed_at`, `fifth_shift_completed_at`.
+
+=======
+>>>>>>> Stashed changes
 ### Создать кампанию предложений смены
 
-Смена должна быть в статусе `A20_SOURCING`.
+Смена должна быть в статусе `A20_SOURCING`. Предложения создаются только исполнителям с подтверждённым типом оформления и готовой стадией воронки. Если хотя бы один исполнитель не прошёл проверку, возвращается `409 performer_not_ready`, а кампания и предложения не создаются.
 
 ```http
 POST /shifts/{shiftId}/offer-campaigns
@@ -230,8 +243,7 @@ Content-Type: application/json
 
 ```json
 {
-  "performer_ids": ["performer-uuid-1", "performer-uuid-2"],
-  "created_by_user_id": "manager-user-id"
+  "performer_ids": ["performer-uuid-1", "performer-uuid-2"]
 }
 ```
 
@@ -250,7 +262,22 @@ POST /public/shift-offers/{token}/accept
 POST /public/shift-offers/{token}/decline
 ```
 
-`POST /viewed` логирует каждый просмотр, даже если offer уже недоступен. `POST /accept` является transactional command: если смена уже занята, второй исполнитель получает `409 offer_lost`.
+<<<<<<< Updated upstream
+`POST /viewed` логирует каждый просмотр, даже если offer уже недоступен. `POST /accept` является transactional command: если смена уже занята, второй исполнитель получает `409 offer_lost`. Ответ `accept` содержит снимок типа оформления `assignment.engagement_type` и не раскрывает `token_hash` и `responded_at`.
+
+### Факты воронки и outbox
+
+OMS5 публикует факты для OMS2 в topic `operations.performer.v1` с ключом `person_id`:
+
+- `operations.shift.assigned` — принятие предложения;
+- `operations.shift.completed` — переход смены в `A60_SETTLE` или в `A80_CLOSED` с `close_reason=paid`.
+
+Факт пишется в `operations_outbox` в той же транзакции, что и изменение назначения или смены. Фоновый publisher выбирает неопубликованные строки через `FOR UPDATE SKIP LOCKED`, публикует их и заполняет `published_at`. При недоступной Kafka строка остаётся в outbox, увеличивается `attempts` и заполняется `last_error`; после восстановления Kafka факт публикуется без повторного HTTP-запроса. Publisher использует `enable.idempotence=true` и `acks=all`.
+
+`operations.shift.performer_assigned` сохраняется для обратной совместимости и не заменяет новые факты.
+=======
+Accept возвращает снимок assignment.engagement_type. Публичный ответ не содержит token_hash и responded_at.
+>>>>>>> Stashed changes
 
 ### Создать табельную запись
 
@@ -322,7 +349,10 @@ GET /operations/summary
 
 ```text
 app/migrations/001_create_operational_state.sql
+app/migrations/002_performer_funnel_and_outbox.sql
 ```
+
+Применённые версии фиксируются в `schema_migrations`.
 
 Подключение задается переменной `DATABASE_URL`. В Kubernetes она передается через Secret. Для локального запуска:
 
@@ -346,7 +376,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8005
 - `operations.shift.offer_declined` - исполнитель отказался.
 - `operations.shift.offer_won` - предложение победило.
 - `operations.shift.offer_lost` - предложение проиграло, смена уже занята.
-- `operations.shift.performer_assigned` - исполнитель назначен.
+- `operations.shift.performer_assigned` - legacy-событие назначения, сохранено для совместимости.
+- `operations.shift.assigned` и `operations.shift.completed` - факты в topic `operations.performer.v1`, ключ — `person_id`.
 - `operations.timesheet.submitted` - табель отправлен.
 - `operations.shift.closed` - смена закрыта.
 
@@ -378,6 +409,14 @@ Consumer-ы должны выполнять идемпотентность по 
 | `SERVICE_NAME` | `OMS5` | Имя сервиса |
 | `KAFKA_BOOTSTRAP_SERVERS` | `kafka.oms.svc.cluster.local:9092` | Kafka bootstrap servers |
 | `DATABASE_URL` | `postgresql://oms5:oms5@oms5-postgres:5432/oms5` | PostgreSQL connection string; в Kubernetes передается через Secret |
+<<<<<<< Updated upstream
+| `ENABLE_FUNNEL_OUTBOX` | `true` | Запуск фонового publisher-а outbox; `0`, `false`, `no` отключают поток |
+| `FUNNEL_OUTBOX_BATCH_SIZE` | `100` | Размер пакета публикации outbox |
+=======
+| `ENABLE_FUNNEL_OUTBOX` | `true` | Включает фоновый publisher; `0`, `false` и `no` отключают его |
+| `FUNNEL_OUTBOX_BATCH_SIZE` | `100` | Размер пакета outbox |
+>>>>>>> Stashed changes
+| `FUNNEL_OUTBOX_POLL_INTERVAL` | `1.0` | Интервал опроса outbox в секундах |
 
 ## Локальный запуск
 

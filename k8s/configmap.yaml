@@ -9,3 +9,4 @@ data:
   KAFKA_BOOTSTRAP_SERVERS: kafka.oms.svc.cluster.local:9092
   OMS1_AUTH_BASE_URL: http://oms1.oms.svc.cluster.local
   SERVICE_CLIENT_ID: OMS5
+  ENABLE_FUNNEL_OUTBOX: "true"

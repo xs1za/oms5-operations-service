@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     service_client_secret: str = ""
     oms2_service_secret: str = ""
     database_url: str = "postgresql://oms5:oms5@oms5-postgres:5432/oms5"
+    enable_funnel_outbox: str = "true"
+    funnel_outbox_batch_size: int = 100
+    funnel_outbox_poll_interval: float = 1.0
 
 
 settings = Settings()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -13,11 +14,76 @@ from psycopg.types.json import Jsonb
 from app.settings import settings
 
 
-MIGRATION_PATH = Path(__file__).with_name("migrations") / "001_create_operational_state.sql"
+MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+MIGRATION_PATH = MIGRATIONS_DIR / "001_create_operational_state.sql"
+
+logger = logging.getLogger(settings.service_name)
+
+ENGAGEMENT_TYPES = {"gph", "self_employed"}
+ENGAGEMENT_VALIDATION_STATUSES = {"pending", "verified", "rejected"}
+MEDICAL_BOOK_STATUSES = {"none", "non_food", "food"}
+FUNNEL_STAGES = {
+    "PERFORMER_BLANK",
+    "PERFORMER_PROFILE",
+    "PERFORMER_DOCS_PENDING",
+    "PERFORMER_READY_NON_MEDICAL",
+    "PERFORMER_READY_NON_FOOD",
+    "PERFORMER_READY_FOOD",
+    "PERFORMER_BOOKED_SHIFT",
+    "PERFORMER_FIRST_SHIFT_COMPLETED",
+    "PERFORMER_FIFTH_SHIFT_COMPLETED",
+    "PERFORMER_PROFILE_DELETED",
+}
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def allowed_value(value: Any, allowed: set[str], field: str, person_id: int | None = None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in allowed:
+        logger.warning(
+            "Ignored unknown %s value",
+            field,
+            extra={"person_id": person_id, "value": value, "error_code": f"unknown_{field}"},
+        )
+        return None
+    return value
+
+
+def keep_or_update(payload: dict[str, Any], key: str, current: str | None, allowed: set[str], person_id: int) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return current
+    return allowed_value(value, allowed, key, person_id) or current
+
+
+def max_completed_shifts(current: Any, value: Any) -> int:
+    try:
+        incoming = int(value)
+    except (TypeError, ValueError):
+        return int(current or 0)
+    return max(int(current or 0), incoming)
 
 
 def json_value(value: Any) -> Jsonb:
@@ -41,7 +107,27 @@ class OperationalStorage:
 
     def migrate(self) -> None:
         with self.connection() as connection:
-            connection.execute(MIGRATION_PATH.read_text(encoding="utf-8"))
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version VARCHAR(100) PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            applied = {
+                row["version"]
+                for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
+            }
+            for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if path.stem in applied:
+                    continue
+                connection.execute(path.read_text(encoding="utf-8"))
+                connection.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (%s) ON CONFLICT (version) DO NOTHING",
+                    (path.stem,),
+                )
+                logger.info("Applied migration %s", path.stem)
 
     def check(self) -> dict[str, Any]:
         try:
@@ -144,13 +230,23 @@ class OperationalStorage:
                 row = connection.execute(
                     """
                     INSERT INTO performers
-                        (id, person_id, display_name, email, phone, status, source_version, synced_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        (id, person_id, display_name, email, phone, status, source_version, synced_at,
+                         engagement_type, engagement_type_validation_status, funnel_stage, medical_book_status,
+                         completed_shifts_count, first_booked_at, first_shift_completed_at, fifth_shift_completed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
                         item["id"], item["person_id"], item["display_name"], item["email"],
                         item["phone"], item["status"], item["source_version"], item["synced_at"],
+                        self._engagement_type(item.get("engagement_type"), item["person_id"]),
+                        self._validation_status(item.get("engagement_type_validation_status"), item["person_id"]),
+                        self._funnel_stage(item.get("funnel_stage"), item["person_id"]),
+                        allowed_value(item.get("medical_book_status"), MEDICAL_BOOK_STATUSES, "medical_book_status", item["person_id"]),
+                        max_completed_shifts(0, item.get("completed_shifts_count")),
+                        parse_datetime(item.get("first_booked_at")),
+                        parse_datetime(item.get("first_shift_completed_at")),
+                        parse_datetime(item.get("fifth_shift_completed_at")),
                     ),
                 ).fetchone()
             else:
@@ -158,16 +254,45 @@ class OperationalStorage:
                     """
                     UPDATE performers
                     SET display_name = %s, email = %s, phone = %s, status = %s,
-                        source_version = %s, synced_at = %s
+                        source_version = %s, synced_at = %s,
+                        engagement_type = COALESCE(%s, engagement_type),
+                        engagement_type_validation_status = COALESCE(%s, engagement_type_validation_status),
+                        funnel_stage = COALESCE(%s, funnel_stage),
+                        medical_book_status = COALESCE(%s, medical_book_status),
+                        completed_shifts_count = GREATEST(completed_shifts_count, %s),
+                        first_booked_at = COALESCE(%s, first_booked_at),
+                        first_shift_completed_at = COALESCE(%s, first_shift_completed_at),
+                        fifth_shift_completed_at = COALESCE(%s, fifth_shift_completed_at)
                     WHERE person_id = %s AND merged_into_performer_id IS NULL
                     RETURNING *
                     """,
                     (
                         item["display_name"], item["email"], item["phone"], item["status"],
-                        item["source_version"], item["synced_at"], item["person_id"],
+                        item["source_version"], item["synced_at"],
+                        self._engagement_type(item.get("engagement_type"), item["person_id"]),
+                        self._validation_status(item.get("engagement_type_validation_status"), item["person_id"]),
+                        self._funnel_stage(item.get("funnel_stage"), item["person_id"]),
+                        allowed_value(item.get("medical_book_status"), MEDICAL_BOOK_STATUSES, "medical_book_status", item["person_id"]),
+                        max_completed_shifts(0, item.get("completed_shifts_count")),
+                        parse_datetime(item.get("first_booked_at")),
+                        parse_datetime(item.get("first_shift_completed_at")),
+                        parse_datetime(item.get("fifth_shift_completed_at")),
+                        item["person_id"],
                     ),
                 ).fetchone()
             return normalize_row(row)  # type: ignore[return-value]
+
+    @staticmethod
+    def _engagement_type(value: Any, person_id: int | None) -> str | None:
+        return allowed_value(value, ENGAGEMENT_TYPES, "engagement_type", person_id)
+
+    @staticmethod
+    def _validation_status(value: Any, person_id: int | None) -> str | None:
+        return allowed_value(value, ENGAGEMENT_VALIDATION_STATUSES, "engagement_type_validation_status", person_id)
+
+    @staticmethod
+    def _funnel_stage(value: Any, person_id: int | None) -> str | None:
+        return allowed_value(value, FUNNEL_STAGES, "funnel_stage", person_id)
 
     def get_performer_by_person_id(self, person_id: int) -> dict[str, Any] | None:
         with self.connection() as connection:
@@ -248,7 +373,7 @@ class OperationalStorage:
 
     def _apply_performer_profile(self, connection, payload: dict[str, Any], person_id: int, now: datetime, aggregate_version: int) -> None:
         row = connection.execute(
-            "SELECT id, source_version FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
+            "SELECT * FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
             (person_id,),
         ).fetchone()
         display_name = (payload.get("display_name") or f"Performer {person_id}")[:255]
@@ -257,24 +382,46 @@ class OperationalStorage:
             connection.execute(
                 """
                 INSERT INTO performers
-                    (id, person_id, display_name, email, phone, status, source_version, synced_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (id, person_id, display_name, email, phone, status, source_version, synced_at,
+                     engagement_type, engagement_type_validation_status, funnel_stage, medical_book_status,
+                     completed_shifts_count, first_booked_at, first_shift_completed_at, fifth_shift_completed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     str(__import__("uuid").uuid4()), person_id, display_name, payload.get("email"),
                     payload.get("phone"), status, max(aggregate_version, 1), now,
+                    self._engagement_type(payload.get("engagement_type"), person_id),
+                    self._validation_status(payload.get("engagement_type_validation_status"), person_id),
+                    self._funnel_stage(payload.get("funnel_stage"), person_id),
+                    allowed_value(payload.get("medical_book_status"), MEDICAL_BOOK_STATUSES, "medical_book_status", person_id),
+                    max_completed_shifts(0, payload.get("completed_shifts_count")),
+                    parse_datetime(payload.get("first_booked_at")),
+                    parse_datetime(payload.get("first_shift_completed_at")),
+                    parse_datetime(payload.get("fifth_shift_completed_at")),
                 ),
             )
             return
         connection.execute(
             """
             UPDATE performers
-            SET display_name = %s, email = %s, phone = %s, status = %s, source_version = %s, synced_at = %s
+            SET display_name = %s, email = %s, phone = %s, status = %s, source_version = %s, synced_at = %s,
+                engagement_type = %s, engagement_type_validation_status = %s, funnel_stage = %s,
+                medical_book_status = %s, completed_shifts_count = %s, first_booked_at = %s,
+                first_shift_completed_at = %s, fifth_shift_completed_at = %s
             WHERE id = %s
             """,
             (
                 display_name, payload.get("email"), payload.get("phone"), status,
-                max(aggregate_version, 1), now, row["id"],
+                max(aggregate_version, 1), now,
+                keep_or_update(payload, "engagement_type", row["engagement_type"], ENGAGEMENT_TYPES, person_id),
+                keep_or_update(payload, "engagement_type_validation_status", row["engagement_type_validation_status"], ENGAGEMENT_VALIDATION_STATUSES, person_id),
+                keep_or_update(payload, "funnel_stage", row["funnel_stage"], FUNNEL_STAGES, person_id),
+                keep_or_update(payload, "medical_book_status", row["medical_book_status"], MEDICAL_BOOK_STATUSES, person_id),
+                max_completed_shifts(row["completed_shifts_count"], payload.get("completed_shifts_count")),
+                parse_datetime(payload.get("first_booked_at")) or row["first_booked_at"],
+                parse_datetime(payload.get("first_shift_completed_at")) or row["first_shift_completed_at"],
+                parse_datetime(payload.get("fifth_shift_completed_at")) or row["fifth_shift_completed_at"],
+                row["id"],
             ),
         )
 
@@ -483,6 +630,14 @@ class OperationalStorage:
             if shift["status"] != "A20_SOURCING":
                 return {"conflict": True, "reason": "shift_not_sourcing", "offer": offer, "shift": shift}
 
+            performer = connection.execute(
+                "SELECT id, person_id, engagement_type FROM performers WHERE id = %s",
+                (offer["performer_id"],),
+            ).fetchone()
+            if performer is None or not performer["engagement_type"]:
+                return {"conflict": True, "reason": "performer_not_ready", "offer": offer, "shift": shift}
+
+            assignment["engagement_type"] = performer["engagement_type"]
             offer = normalize_row(connection.execute(
                 """
                 UPDATE shift_offers SET status = 'won', responded_at = %s
@@ -493,12 +648,13 @@ class OperationalStorage:
             connection.execute(
                 """
                 INSERT INTO shift_assignments
-                    (id, shift_id, performer_id, offer_id, status, assigned_at, removed_at, reason)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (id, shift_id, performer_id, offer_id, status, assigned_at, removed_at, reason, engagement_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     assignment["id"], assignment["shift_id"], assignment["performer_id"], assignment["offer_id"],
                     assignment["status"], assignment["assigned_at"], assignment["removed_at"], assignment["reason"],
+                    assignment["engagement_type"],
                 ),
             )
             lost_offers = connection.execute(
@@ -510,10 +666,12 @@ class OperationalStorage:
                 (shift["id"], offer["id"]),
             ).fetchall()
             shift["assigned_performer_id"] = offer["performer_id"]
+            shift["assigned_performer_person_id"] = performer["person_id"]
             shift["status"] = "A30_CHOICE"
             shift["updated_at"] = assignment["assigned_at"]
             shift = self.update_shift(connection, shift)
             history = self.insert_history(connection, history)
+            self._enqueue_assignment_fact(connection, shift, assignment, performer)
             return {
                 "conflict": False,
                 "offer": offer,
@@ -522,6 +680,110 @@ class OperationalStorage:
                 "history": history,
                 "lost_offers": [normalize_row(row) for row in lost_offers],
             }
+
+    def _enqueue_assignment_fact(self, connection, shift: dict[str, Any], assignment: dict[str, Any], performer: dict[str, Any]) -> None:
+        from app.funnel_outbox import FACT_ASSIGNED, enqueue_fact
+
+        person_id = shift.get("assigned_performer_person_id") or performer.get("person_id")
+        if person_id is None:
+            logger.warning(
+                "Funnel assignment fact skipped: person_id is missing",
+                extra={
+                    "assignment_id": assignment.get("id"),
+                    "shift_id": shift.get("id"),
+                    "error_code": "funnel_fact_missing_person",
+                },
+            )
+            return
+        enqueue_fact(
+            connection,
+            event_type=FACT_ASSIGNED,
+            person_id=int(person_id),
+            assignment_id=assignment["id"],
+            occurred_at=assignment["assigned_at"],
+            payload={
+                "person_id": str(person_id),
+                "performer_id": assignment["performer_id"],
+                "shift_id": assignment["shift_id"],
+                "assignment_id": assignment["id"],
+                "engagement_type": assignment.get("engagement_type"),
+                "assigned_at": utc_iso(assignment["assigned_at"]),
+            },
+        )
+
+    def prepare_shift_completion(self, connection, shift: dict[str, Any], occurred_at: datetime) -> dict[str, Any] | None:
+        """Fill assignment completion and return funnel fact arguments for a finished shift."""
+        from app.funnel_outbox import FACT_COMPLETED
+
+        if not shift.get("assigned_performer_id"):
+            return None
+        assignment = connection.execute(
+            """
+            SELECT * FROM shift_assignments
+            WHERE shift_id = %s AND status = 'assigned' AND removed_at IS NULL AND completed_at IS NULL
+            ORDER BY assigned_at DESC, id
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (shift["id"],),
+        ).fetchone()
+        if assignment is None:
+            return None
+        connection.execute(
+            "UPDATE shift_assignments SET completed_at = %s WHERE id = %s",
+            (occurred_at, assignment["id"]),
+        )
+        person_id = shift.get("assigned_performer_person_id")
+        if person_id is None:
+            performer = connection.execute(
+                "SELECT person_id FROM performers WHERE id = %s",
+                (assignment["performer_id"],),
+            ).fetchone()
+            person_id = performer["person_id"] if performer else None
+        if person_id is None:
+            logger.warning(
+                "Funnel completion fact skipped: person_id is missing",
+                extra={
+                    "assignment_id": assignment["id"],
+                    "shift_id": shift["id"],
+                    "error_code": "funnel_fact_missing_person",
+                },
+            )
+            return None
+        timesheets = connection.execute(
+            """
+            SELECT id, performer_id, work_date, hours
+            FROM timesheets
+            WHERE shift_id = %s AND performer_id = %s
+            ORDER BY work_date, id
+            """,
+            (shift["id"], assignment["performer_id"]),
+        ).fetchall()
+        total_hours = sum(float(row["hours"]) for row in timesheets)
+        return {
+            "event_type": FACT_COMPLETED,
+            "person_id": int(person_id),
+            "assignment_id": assignment["id"],
+            "occurred_at": occurred_at,
+            "payload": {
+                "person_id": str(person_id),
+                "performer_id": assignment["performer_id"],
+                "shift_id": assignment["shift_id"],
+                "assignment_id": assignment["id"],
+                "engagement_type": assignment["engagement_type"],
+                "completed_at": utc_iso(occurred_at),
+                "hours": total_hours,
+                "timesheets": [
+                    {
+                        "id": row["id"],
+                        "performer_id": row["performer_id"],
+                        "work_date": row["work_date"].isoformat(),
+                        "hours": float(row["hours"]),
+                    }
+                    for row in timesheets
+                ],
+            },
+        }
 
     def decline_offer(self, token_hash: str) -> tuple[dict[str, Any], dict[str, Any], bool]:
         with self.connection() as connection:
