@@ -55,11 +55,17 @@ class OperationalStorage:
         with self.connection() as connection:
             row = connection.execute(
                 """
-                INSERT INTO clients (id, name, external_id, created_at)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO clients
+                    (id, name, external_id, client_type_code, parent_client_id, created_at,
+                     address, country_code, timezone, lon, lat)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (item["id"], item["name"], item["external_id"], item["created_at"]),
+                (
+                    item["id"], item["name"], item.get("external_id"), item.get("client_type_code", "object"),
+                    item.get("parent_client_id"), item["created_at"], item.get("address"),
+                    item.get("country_code"), item.get("timezone"), item.get("lon"), item.get("lat"),
+                ),
             ).fetchone()
             return normalize_row(row)  # type: ignore[return-value]
 
@@ -67,18 +73,83 @@ class OperationalStorage:
         with self.connection() as connection:
             return normalize_row(connection.execute("SELECT * FROM clients WHERE id = %s", (client_id,)).fetchone())
 
+    def client_within_scope(self, organization_id: str, client_id: str) -> bool:
+        current: str | None = client_id
+        while current is not None:
+            if current == organization_id:
+                return True
+            row = self.get_client(current)
+            if row is None:
+                return False
+            current = row.get("parent_client_id")
+        return False
+
+    def client_depth(self, client_id: str) -> int:
+        depth = 0
+        current: str | None = client_id
+        while current is not None:
+            row = self.get_client(current)
+            if row is None:
+                break
+            current = row.get("parent_client_id")
+            depth += 1
+        return depth
+
+    def node_has_children(self, client_id: str) -> bool:
+        with self.connection() as connection:
+            count = connection.execute(
+                "SELECT count(*) AS count FROM clients WHERE parent_client_id = %s", (client_id,)
+            ).fetchone()["count"]
+            return count > 0
+
+    def descendant_client_ids(self, organization_id: str) -> list[str]:
+        with self.connection() as connection:
+            rows = connection.execute("SELECT id, parent_client_id FROM clients").fetchall()
+        children: dict[str, list[str]] = {}
+        for row in rows:
+            children.setdefault(row["parent_client_id"], []).append(row["id"])
+        result: list[str] = []
+        stack = [organization_id]
+        while stack:
+            node = stack.pop()
+            result.append(node)
+            stack.extend(children.get(node, []))
+        return result
+
+    def assignment_stats(self, organization_id: str) -> dict[str, Any]:
+        client_ids = self.descendant_client_ids(organization_id)
+        if not client_ids:
+            return {"organization_id": organization_id, "total_shifts": 0, "assigned_shifts": 0, "unassigned_shifts": 0}
+        with self.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT assigned_performer_id
+                FROM shifts
+                WHERE client_id = ANY(%s)
+                """,
+                (client_ids,),
+            ).fetchall()
+        total = len(rows)
+        assigned = sum(1 for row in rows if row["assigned_performer_id"] is not None)
+        return {
+            "organization_id": organization_id,
+            "total_shifts": total,
+            "assigned_shifts": assigned,
+            "unassigned_shifts": total - assigned,
+        }
+
     def sync_performer(self, item: dict[str, Any], created: bool) -> dict[str, Any]:
         with self.connection() as connection:
             if created:
                 row = connection.execute(
                     """
                     INSERT INTO performers
-                        (id, employee_id, display_name, email, phone, status, source_version, synced_at)
+                        (id, person_id, display_name, email, phone, status, source_version, synced_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
-                        item["id"], item["employee_id"], item["display_name"], item["email"],
+                        item["id"], item["person_id"], item["display_name"], item["email"],
                         item["phone"], item["status"], item["source_version"], item["synced_at"],
                     ),
                 ).fetchone()
@@ -88,25 +159,153 @@ class OperationalStorage:
                     UPDATE performers
                     SET display_name = %s, email = %s, phone = %s, status = %s,
                         source_version = %s, synced_at = %s
-                    WHERE employee_id = %s
+                    WHERE person_id = %s AND merged_into_performer_id IS NULL
                     RETURNING *
                     """,
                     (
                         item["display_name"], item["email"], item["phone"], item["status"],
-                        item["source_version"], item["synced_at"], item["employee_id"],
+                        item["source_version"], item["synced_at"], item["person_id"],
                     ),
                 ).fetchone()
             return normalize_row(row)  # type: ignore[return-value]
 
-    def get_performer_by_employee_id(self, employee_id: int) -> dict[str, Any] | None:
+    def get_performer_by_person_id(self, person_id: int) -> dict[str, Any] | None:
         with self.connection() as connection:
             return normalize_row(
-                connection.execute("SELECT * FROM performers WHERE employee_id = %s", (employee_id,)).fetchone()
+                connection.execute(
+                    "SELECT * FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
+                    (person_id,),
+                ).fetchone()
             )
 
     def get_performer(self, performer_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             return normalize_row(connection.execute("SELECT * FROM performers WHERE id = %s", (performer_id,)).fetchone())
+
+    def update_performer(self, performer_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        if not values:
+            return self.get_performer(performer_id)
+        assignments = ", ".join(f"{column} = %s" for column in values)
+        params = list(values.values()) + [performer_id]
+        with self.connection() as connection:
+            row = connection.execute(
+                f"UPDATE performers SET {assignments}, synced_at = now() WHERE id = %s RETURNING *",
+                params,
+            ).fetchone()
+            return normalize_row(row) if row else None
+
+    def apply_person_event(self, event: dict[str, Any]) -> str:
+        """Apply a people.performer.v1 event transactionally, with inbox and version ordering."""
+        event_id = event.get("event_id")
+        aggregate_id = int(event.get("aggregate_id"))
+        aggregate_version = int(event.get("aggregate_version") or 0)
+        event_type = event.get("event_type") or ""
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        now = utcnow()
+
+        with self.connection() as connection:
+            duplicate = connection.execute(
+                "SELECT event_id FROM person_event_inbox WHERE event_id = %s", (event_id,)
+            ).fetchone()
+            if duplicate is not None:
+                return "duplicate"
+
+            state = connection.execute(
+                "SELECT last_version FROM person_consumer_state WHERE aggregate_id = %s FOR UPDATE",
+                (aggregate_id,),
+            ).fetchone()
+            last_version = int(state["last_version"]) if state else 0
+            if aggregate_version <= last_version:
+                return "stale"
+            if aggregate_version != last_version + 1:
+                return "gap"
+
+            if event_type == "people.merged":
+                self._apply_merged_event(connection, payload, aggregate_id, now)
+            else:
+                self._apply_performer_profile(connection, payload, aggregate_id, now, aggregate_version)
+
+            connection.execute(
+                """
+                INSERT INTO person_event_inbox
+                    (event_id, event_type, aggregate_id, aggregate_version, payload, processed_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (event_id, event_type, aggregate_id, aggregate_version, json_value(payload), now),
+            )
+            connection.execute(
+                """
+                INSERT INTO person_consumer_state (aggregate_id, last_version, last_event_id, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (aggregate_id) DO UPDATE
+                SET last_version = EXCLUDED.last_version,
+                    last_event_id = EXCLUDED.last_event_id,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (aggregate_id, aggregate_version, event_id, now),
+            )
+            return "applied"
+
+    def _apply_performer_profile(self, connection, payload: dict[str, Any], person_id: int, now: datetime, aggregate_version: int) -> None:
+        row = connection.execute(
+            "SELECT id, source_version FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
+            (person_id,),
+        ).fetchone()
+        display_name = (payload.get("display_name") or f"Performer {person_id}")[:255]
+        status = payload.get("profile_status") or payload.get("status") or "active"
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO performers
+                    (id, person_id, display_name, email, phone, status, source_version, synced_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(__import__("uuid").uuid4()), person_id, display_name, payload.get("email"),
+                    payload.get("phone"), status, max(aggregate_version, 1), now,
+                ),
+            )
+            return
+        connection.execute(
+            """
+            UPDATE performers
+            SET display_name = %s, email = %s, phone = %s, status = %s, source_version = %s, synced_at = %s
+            WHERE id = %s
+            """,
+            (
+                display_name, payload.get("email"), payload.get("phone"), status,
+                max(aggregate_version, 1), now, row["id"],
+            ),
+        )
+
+    def _apply_merged_event(self, connection, payload: dict[str, Any], duplicate_person_id: int, now: datetime) -> None:
+        canonical_person_id = payload.get("canonical_person_id")
+        if canonical_person_id is None:
+            return
+        canonical_person_id = int(canonical_person_id)
+
+        duplicate = connection.execute(
+            "SELECT * FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
+            (duplicate_person_id,),
+        ).fetchone()
+        canonical = connection.execute(
+            "SELECT * FROM performers WHERE person_id = %s AND merged_into_performer_id IS NULL",
+            (canonical_person_id,),
+        ).fetchone()
+
+        if duplicate is None:
+            return
+        if canonical is None:
+            # Canonical profile not received yet: keep the profile id and rebind it to the canonical person.
+            connection.execute(
+                "UPDATE performers SET person_id = %s, synced_at = %s WHERE id = %s",
+                (canonical_person_id, now, duplicate["id"]),
+            )
+            return
+        connection.execute(
+            "UPDATE performers SET status = 'merged', merged_into_performer_id = %s, synced_at = %s WHERE id = %s",
+            (canonical["id"], now, duplicate["id"]),
+        )
 
     def create_shift(self, item: dict[str, Any]) -> dict[str, Any]:
         with self.connection() as connection:
@@ -114,15 +313,17 @@ class OperationalStorage:
                 """
                 INSERT INTO shifts (
                     id, client_id, starts_at, ends_at, location, required_performers_count,
-                    created_by_user_id, status, assigned_performer_id, close_reason,
+                    created_by_user_id, created_by_person_id, created_by_display_name,
+                    status, assigned_performer_id, assigned_performer_person_id, close_reason,
                     failure_reason, auto_closed, auto_close_reason, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
                     item["id"], item["client_id"], item["starts_at"], item["ends_at"], item["location"],
-                    item["required_performers_count"], item["created_by_user_id"], item["status"],
-                    item["assigned_performer_id"], item["close_reason"], item["failure_reason"],
+                    item["required_performers_count"], item.get("created_by_user_id"), item.get("created_by_person_id"),
+                    item.get("created_by_display_name"), item["status"], item["assigned_performer_id"],
+                    item.get("assigned_performer_person_id"), item["close_reason"], item["failure_reason"],
                     item["auto_closed"], item["auto_close_reason"], item["created_at"], item["updated_at"],
                 ),
             ).fetchone()
@@ -141,32 +342,44 @@ class OperationalStorage:
         row = connection.execute(
             """
             UPDATE shifts
-            SET status = %s, assigned_performer_id = %s, close_reason = %s,
+            SET status = %s, assigned_performer_id = %s, assigned_performer_person_id = %s, close_reason = %s,
                 failure_reason = %s, auto_closed = %s, auto_close_reason = %s, updated_at = %s
             WHERE id = %s
             RETURNING *
             """,
             (
-                shift["status"], shift["assigned_performer_id"], shift["close_reason"],
-                shift["failure_reason"], shift["auto_closed"], shift["auto_close_reason"],
+                shift["status"], shift["assigned_performer_id"], shift.get("assigned_performer_person_id"),
+                shift["close_reason"], shift["failure_reason"], shift["auto_closed"], shift["auto_close_reason"],
                 shift["updated_at"], shift["id"],
             ),
         ).fetchone()
         return normalize_row(row)  # type: ignore[return-value]
+
+    def update_shift_fields(self, shift_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+        if not values:
+            return self.get_shift(shift_id)
+        assignments = ", ".join(f"{column} = %s" for column in values)
+        params = list(values.values()) + [shift_id]
+        with self.connection() as connection:
+            row = connection.execute(
+                f"UPDATE shifts SET {assignments}, updated_at = now() WHERE id = %s RETURNING *",
+                params,
+            ).fetchone()
+            return normalize_row(row) if row else None
 
     def insert_history(self, connection, item: dict[str, Any]) -> dict[str, Any]:
         row = connection.execute(
             """
             INSERT INTO shift_status_history
                 (id, shift_id, from_status, to_status, transition_code, reason,
-                 actor_user_id, occurred_at, correlation_id, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 actor_user_id, actor_person_id, actor_display_name, occurred_at, correlation_id, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
                 item["id"], item["shift_id"], item["from_status"], item["to_status"],
-                item["transition_code"], item["reason"], item["actor_user_id"],
-                item["occurred_at"], item["correlation_id"], json_value(item["metadata"]),
+                item["transition_code"], item["reason"], item["actor_user_id"], item.get("actor_person_id"),
+                item.get("actor_display_name"), item["occurred_at"], item["correlation_id"], json_value(item["metadata"]),
             ),
         ).fetchone()
         return normalize_row(row)  # type: ignore[return-value]
@@ -183,10 +396,13 @@ class OperationalStorage:
         with self.connection() as connection:
             connection.execute(
                 """
-                INSERT INTO offer_campaigns (id, shift_id, status, created_by_user_id, created_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO offer_campaigns (id, shift_id, status, created_by_user_id, created_by_person_id, created_by_display_name, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (campaign["id"], campaign["shift_id"], campaign["status"], campaign["created_by_user_id"], campaign["created_at"]),
+                (
+                    campaign["id"], campaign["shift_id"], campaign["status"], campaign.get("created_by_user_id"),
+                    campaign.get("created_by_person_id"), campaign.get("created_by_display_name"), campaign["created_at"],
+                ),
             )
             result = []
             for offer in offers:

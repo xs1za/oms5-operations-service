@@ -2,15 +2,19 @@ from datetime import date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from hashlib import sha256
 import logging
+import os
 from secrets import token_urlsafe
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from threading import Thread
 
+from app.auth import OPS_ROLES, principal_person_id, require_operator, require_principal, require_service_token
 from app.healthcheck.router import router as healthcheck_router
 from app.kafka import publish_event
+from app.person_consumer import run_person_consumer
 from app.settings import settings
 from app.storage import storage
 
@@ -91,24 +95,106 @@ ALLOWED_TRANSITIONS = {
 class ClientCreate(BaseModel):
     name: str
     external_id: str | None = None
+    client_type_code: str = "head"
+    parent_client_id: str | None = None
+    address: str | None = None
+    country_code: str | None = None
+    timezone: str | None = None
+    lon: float | None = None
+    lat: float | None = None
+
+    @field_validator("client_type_code")
+    @classmethod
+    def validate_client_type(cls, value: str) -> str:
+        if value not in {"head", "division", "object"}:
+            raise ValueError("client_type_code must be head, division or object")
+        return value
+
+    @field_validator("country_code")
+    @classmethod
+    def validate_country_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().upper()
+        if len(normalized) != 2:
+            raise ValueError("country_code must be a two-letter code")
+        return normalized
+
+    @field_validator("lon", "lat")
+    @classmethod
+    def validate_coordinate(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if not -180 <= value <= 180:
+            raise ValueError("coordinate is out of range")
+        return value
 
 
 class PerformerSync(BaseModel):
-    employee_id: int
-    display_name: str
+    person_id: str | None = None
+    display_name: str = Field(min_length=1, max_length=255)
     email: str | None = None
     phone: str | None = None
     status: str = "active"
-    source_version: int | None = None
+    source_version: int = Field(ge=1)
 
+    # Legacy field kept only for the staged deployment window; person_id wins.
+    employee_id: str | None = None
+
+    @field_validator("person_id", "employee_id", mode="before")
+    @classmethod
+    def normalize_identifier(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, float) or isinstance(value, bool):
+            raise ValueError("identifier must be a decimal string")
+        if isinstance(value, int):
+            return str(value)
+        return str(value)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        if value not in {"active", "inactive"}:
+            raise ValueError("status must be active or inactive")
+        return value
+
+
+def resolve_performer_person_id(payload: PerformerSync) -> int:
+    raw = payload.person_id if payload.person_id is not None else payload.employee_id
+    if raw is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "validation_error", "message": "person_id is required"},
+        )
+    try:
+        person_id = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "validation_error", "message": "person_id must be a decimal BIGINT string"},
+        ) from None
+    if person_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "validation_error", "message": "person_id must be positive"},
+        )
+    if payload.person_id is not None and payload.employee_id is not None:
+        if int(payload.employee_id) != person_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "person_id_conflict", "message": "person_id and legacy employee_id disagree"},
+            )
+    return person_id
 
 class ShiftCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     client_id: str
     starts_at: datetime
     ends_at: datetime
-    location: str | None = None
+    location: str | None = Field(default=None, max_length=255)
     required_performers_count: int = Field(default=1, ge=1, le=1)
-    created_by_user_id: str | None = None
 
     @field_validator("ends_at")
     @classmethod
@@ -120,11 +206,25 @@ class ShiftCreate(BaseModel):
 
 
 class ShiftTransition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     new_status: ShiftStatus
     reason: str | None = None
-    actor_user_id: str | None = None
     close_reason: CloseReason | None = None
     failure_reason: FailureReason | None = None
+
+
+class OfferCampaignCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    performer_ids: list[str] = Field(min_length=1)
+
+    @field_validator("performer_ids")
+    @classmethod
+    def validate_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("performer_ids must not contain duplicates")
+        return value
 
 
 class InternalShiftRead(BaseModel):
@@ -145,11 +245,6 @@ class InternalShiftRead(BaseModel):
         return utc_iso(as_aware(value))
 
 
-class OfferCampaignCreate(BaseModel):
-    performer_ids: list[str] = Field(min_length=1)
-    created_by_user_id: str | None = None
-
-
 class TimesheetCreate(BaseModel):
     performer_id: str
     shift_id: str
@@ -160,6 +255,8 @@ class TimesheetCreate(BaseModel):
 @app.on_event("startup")
 def initialize_database() -> None:
     storage.migrate()
+    if os.environ.get("ENABLE_PERSON_CONSUMER", "true").lower() not in {"0", "false", "no"}:
+        Thread(target=run_person_consumer, daemon=True).start()
 
 
 def utcnow() -> datetime:
@@ -172,6 +269,57 @@ def utc_iso(value: datetime) -> str:
 
 def as_aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _person_id_str(value: int | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _serialize_shift_author(item: dict) -> dict:
+    result = dict(item)
+    result["created_by_person_id"] = _person_id_str(result.get("created_by_person_id"))
+    result["assigned_performer_person_id"] = _person_id_str(result.get("assigned_performer_person_id"))
+    return result
+
+
+def _serialize_history(item: dict) -> dict:
+    result = dict(item)
+    result["actor_person_id"] = _person_id_str(result.get("actor_person_id"))
+    return result
+
+
+def _serialize_campaign(campaign: dict) -> dict:
+    result = dict(campaign)
+    result["created_by_person_id"] = _person_id_str(result.get("created_by_person_id"))
+    result["created_at"] = utc_iso(as_aware(result["created_at"]))
+    return result
+
+
+def _offer_response(offer: dict, token: str) -> dict:
+    return {
+        "id": offer["id"],
+        "campaign_id": offer["campaign_id"],
+        "shift_id": offer["shift_id"],
+        "performer_id": offer["performer_id"],
+        "status": offer["status"],
+        "expires_at": utc_iso(as_aware(offer["expires_at"])),
+        "sent_at": utc_iso(as_aware(offer["sent_at"])),
+        "public_url": public_offer_url(token),
+        "token": token,
+    }
+
+
+def _performer_response(item: dict) -> dict:
+    return {
+        "id": item["id"],
+        "person_id": _person_id_str(item.get("person_id")),
+        "display_name": item["display_name"],
+        "email": item.get("email"),
+        "phone": item.get("phone"),
+        "status": item.get("status"),
+        "source_version": item.get("source_version"),
+        "synced_at": utc_iso(as_aware(item["synced_at"])),
+    }
 
 
 def event_payload(event_type: str, payload: dict, correlation_id: str | None = None, actor: dict | None = None) -> dict:
@@ -235,7 +383,7 @@ def ensure_open_reporting_period(starts_at: datetime) -> None:
         )
 
 
-def make_history(shift: dict, new_status: ShiftStatus, reason: str | None = None, actor_user_id: str | None = None) -> dict:
+def make_history(shift: dict, new_status: ShiftStatus, reason: str | None = None, actor_user_id: str | None = None, actor_person_id: int | None = None, actor_display_name: str | None = None) -> dict:
     previous_status = shift["status"]
     if new_status not in ALLOWED_TRANSITIONS[ShiftStatus(previous_status)]:
         raise HTTPException(
@@ -250,6 +398,8 @@ def make_history(shift: dict, new_status: ShiftStatus, reason: str | None = None
         "transition_code": f"{previous_status}->{new_status}",
         "reason": reason,
         "actor_user_id": actor_user_id,
+        "actor_person_id": actor_person_id,
+        "actor_display_name": actor_display_name,
         "occurred_at": utcnow(),
         "correlation_id": str(uuid4()),
         "metadata": {},
@@ -291,8 +441,24 @@ def offer_availability(offer: dict, shift: dict) -> dict:
     return {"available": True, "reason": None}
 
 
-@app.post("/clients")
+@app.post("/clients", status_code=status.HTTP_201_CREATED)
 def create_client(payload: ClientCreate) -> dict:
+    parent = payload.parent_client_id
+    parent_row = None
+    if parent is not None:
+        parent_row = storage.get_client(parent)
+        if parent_row is None:
+            raise HTTPException(status_code=404, detail={"code": "client_not_found"})
+        if storage.client_depth(parent) + 1 > 3:
+            raise HTTPException(status_code=422, detail={"code": "invalid_parent_type", "message": "Client hierarchy is limited to three levels"})
+    if payload.client_type_code == "head" and parent is not None:
+        raise HTTPException(status_code=422, detail={"code": "invalid_parent_type", "message": "head must not have a parent"})
+    if payload.client_type_code == "division":
+        if parent is None or parent_row is None or parent_row.get("client_type_code") != "head":
+            raise HTTPException(status_code=422, detail={"code": "invalid_parent_type", "message": "division must have a head parent"})
+    if payload.client_type_code == "object":
+        if parent is not None and (parent_row is None or parent_row.get("client_type_code") != "division"):
+            raise HTTPException(status_code=422, detail={"code": "invalid_parent_type", "message": "object must have a division parent or be autonomous"})
     item = {"id": str(uuid4()), **payload.model_dump(), "created_at": utcnow()}
     item = storage.create_client(item)
     emit("operations.client_created", item)
@@ -300,22 +466,41 @@ def create_client(payload: ClientCreate) -> dict:
 
 
 @app.post("/performers/sync")
-def sync_performer(payload: PerformerSync) -> dict:
-    existing = storage.get_performer_by_employee_id(payload.employee_id)
+def sync_performer(payload: PerformerSync, _: None = Depends(require_service_token)) -> dict:
+    person_id = resolve_performer_person_id(payload)
+    existing = storage.get_performer_by_person_id(person_id)
+    if existing is not None and int(existing.get("source_version") or 0) >= payload.source_version:
+        return _performer_response(existing)
+
     item = {
         "id": existing["id"] if existing else str(uuid4()),
-        **payload.model_dump(),
+        "person_id": person_id,
+        "display_name": payload.display_name,
+        "email": payload.email,
+        "phone": payload.phone,
+        "status": payload.status,
+        "source_version": payload.source_version,
         "synced_at": utcnow(),
     }
     item = storage.sync_performer(item, created=existing is None)
     emit("operations.performer.created" if existing is None else "operations.performer.updated", item)
-    return item
+    return _performer_response(item)
 
 
-@app.post("/shifts")
-def create_shift(payload: ShiftCreate) -> dict:
-    if storage.get_client(payload.client_id) is None:
-        raise HTTPException(status_code=404, detail="Client not found")
+@app.post("/shifts", status_code=status.HTTP_201_CREATED)
+def create_shift(payload: ShiftCreate, principal: dict = Depends(require_principal)) -> dict:
+    client = storage.get_client(payload.client_id)
+    if client is None:
+        raise HTTPException(status_code=404, detail={"code": "client_not_found"})
+    if client.get("client_type_code") != "object":
+        raise HTTPException(status_code=422, detail={"code": "invalid_client_type", "message": "shifts.client_id must reference an object node"})
+    roles = set(principal.get("roles") or [])
+    if "external_user" in roles and not roles.intersection(OPS_ROLES):
+        organization_id = principal.get("organization_id")
+        if not organization_id or not storage.client_within_scope(organization_id, payload.client_id):
+            raise HTTPException(status_code=403, detail={"code": "organization_scope_violation", "message": "Client is outside the user's organization"})
+    else:
+        require_operator(principal)
     ensure_open_reporting_period(payload.starts_at)
     now = utcnow()
     item = {
@@ -323,27 +508,36 @@ def create_shift(payload: ShiftCreate) -> dict:
         **payload.model_dump(),
         "status": ShiftStatus.DRAFT,
         "assigned_performer_id": None,
+        "assigned_performer_person_id": None,
         "close_reason": None,
         "failure_reason": None,
         "auto_closed": False,
         "auto_close_reason": None,
         "created_at": now,
         "updated_at": now,
+        "created_by_user_id": principal.get("user_id"),
+        "created_by_person_id": principal_person_id(principal),
+        "created_by_display_name": principal.get("display_name"),
     }
     item = storage.create_shift(item)
+    item = _serialize_shift_author(item)
     emit("operations.shift.created", item)
     return item
 
 
 @app.post("/shifts/{shift_id}/transition")
-def transition_shift(shift_id: str, payload: ShiftTransition) -> dict:
+def transition_shift(shift_id: str, payload: ShiftTransition, principal: dict = Depends(require_principal)) -> dict:
+    require_operator(principal)
     if payload.new_status == ShiftStatus.CLOSED and not payload.close_reason:
         raise HTTPException(status_code=422, detail="close_reason is required when closing shift")
+    actor_user_id = principal.get("user_id")
+    actor_person_id = principal_person_id(principal)
+    actor_display_name = principal.get("display_name")
     with storage.connection() as connection:
         shift = storage.get_shift(shift_id, for_update=True, connection=connection)
         if shift is None:
             raise HTTPException(status_code=404, detail="Shift not found")
-        history = make_history(shift, payload.new_status, payload.reason, payload.actor_user_id)
+        history = make_history(shift, payload.new_status, payload.reason, actor_user_id, actor_person_id, actor_display_name)
         shift["status"] = payload.new_status
         shift["updated_at"] = utcnow()
         if payload.new_status == ShiftStatus.CLOSED:
@@ -354,32 +548,45 @@ def transition_shift(shift_id: str, payload: ShiftTransition) -> dict:
     emit_shift_status_changed(shift_id, history["from_status"], history["to_status"], history["reason"], history["correlation_id"])
     if payload.new_status == ShiftStatus.CLOSED:
         emit("operations.shift.closed", {"shiftId": shift_id, "closeReason": shift["close_reason"], "failureReason": shift["failure_reason"]})
-    return {"shift": shift, "history": history}
+    return {"shift": _serialize_shift_author(shift), "history": _serialize_history(history)}
 
 
 @app.get("/shifts/{shift_id}/history")
 def get_shift_history(shift_id: str) -> list[dict]:
     if storage.get_shift(shift_id) is None:
         raise HTTPException(status_code=404, detail="Shift not found")
-    return storage.get_history(shift_id)
+    return [_serialize_history(row) for row in storage.get_history(shift_id)]
 
 
 @app.post("/shifts/{shift_id}/offer-campaigns")
-def create_offer_campaign(shift_id: str, payload: OfferCampaignCreate) -> dict:
+def create_offer_campaign(shift_id: str, payload: OfferCampaignCreate, principal: dict = Depends(require_principal)) -> dict:
+    require_operator(principal)
     shift = storage.get_shift(shift_id)
     if shift is None:
-        raise HTTPException(status_code=404, detail="Shift not found")
+        raise HTTPException(status_code=404, detail={"code": "shift_not_found"})
     if shift["status"] != ShiftStatus.SOURCING:
         raise HTTPException(status_code=409, detail={"code": "shift_not_sourcing"})
     missing = [performer_id for performer_id in payload.performer_ids if storage.get_performer(performer_id) is None]
     if missing:
         raise HTTPException(status_code=404, detail={"code": "performers_not_found", "performerIds": missing})
 
+    performers = [storage.get_performer(performer_id) for performer_id in payload.performer_ids]
+    actor_person_id = principal_person_id(principal)
+    for performer in performers:
+        if performer.get("merged_into_performer_id"):
+            raise HTTPException(status_code=409, detail={"code": "performer_merged", "message": "Merged performer profiles cannot receive new offers"})
+        if performer.get("status") not in (None, "active"):
+            raise HTTPException(status_code=409, detail={"code": "performer_inactive", "message": "Performer profile is not active"})
+        if actor_person_id is not None and performer.get("person_id") == actor_person_id:
+            raise HTTPException(status_code=409, detail={"code": "self_assignment_not_allowed", "message": "An operator cannot assign themselves to a shift"})
+
     campaign = {
         "id": str(uuid4()),
         "shift_id": shift_id,
         "status": CampaignStatus.SENT,
-        "created_by_user_id": payload.created_by_user_id,
+        "created_by_user_id": principal.get("user_id"),
+        "created_by_person_id": actor_person_id,
+        "created_by_display_name": principal.get("display_name"),
         "created_at": utcnow(),
     }
     offers = []
@@ -395,10 +602,10 @@ def create_offer_campaign(shift_id: str, payload: OfferCampaignCreate) -> dict:
     stored_offers = storage.create_campaign(campaign, offers)
     created_offers = []
     for offer, raw_token in zip(stored_offers, response_tokens):
-        created_offers.append(offer | {"public_url": public_offer_url(raw_token), "token": raw_token})
+        created_offers.append(_offer_response(offer, raw_token))
         emit("operations.shift.offer_sent", {"shiftId": shift_id, "offerId": offer["id"], "performerId": offer["performer_id"]})
     emit("operations.shift.offer_campaign_created", {"shiftId": shift_id, "campaignId": campaign["id"]})
-    return {"campaign": campaign, "offers": created_offers}
+    return {"campaign": _serialize_campaign(campaign), "offers": created_offers}
 
 
 @app.get("/public/shift-offers/{token}")
@@ -437,6 +644,8 @@ def accept_offer(token: str) -> dict:
 
     accepted_offer = result["offer"]
     assigned_shift = result["shift"]
+    assigned_shift["assigned_performer_person_id"] = offer.get("performer_person_id") or storage.get_performer(offer["performer_id"]).get("person_id")
+    storage.update_shift_fields(assigned_shift["id"], {"assigned_performer_person_id": assigned_shift["assigned_performer_person_id"]})
     for other_offer in result.get("lost_offers", []):
         emit("operations.shift.offer_lost", {"shiftId": assigned_shift["id"], "offerId": other_offer["id"], "performerId": other_offer["performer_id"]})
     emit_shift_status_changed(
@@ -499,6 +708,19 @@ def auto_close_unfilled_shifts() -> dict:
         emit_shift_status_changed(shift["id"], history["from_status"], history["to_status"], history["reason"], history["correlation_id"])
         emit("operations.shift.closed", {"shiftId": shift["id"], "closeReason": shift["close_reason"], "failureReason": shift["failure_reason"], "autoClosed": True})
     return {"closed": closed, "count": len(closed)}
+
+
+@app.get("/external/assignment-stats")
+def external_assignment_stats(principal: dict = Depends(require_principal)) -> dict:
+    roles = set(principal.get("roles") or [])
+    if "external_user" not in roles:
+        raise HTTPException(status_code=403, detail={"code": "external_user_scope_required", "message": "An external_user role is required"})
+    organization_id = principal.get("organization_id")
+    if not organization_id:
+        raise HTTPException(status_code=403, detail={"code": "external_user_scope_required", "message": "No organization scope on token"})
+    stats = storage.assignment_stats(organization_id)
+    stats["generated_at"] = utc_iso(utcnow())
+    return stats
 
 
 @app.get("/operations/summary")

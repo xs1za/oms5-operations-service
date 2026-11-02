@@ -22,19 +22,19 @@ class OperationalStoragePostgresTest(unittest.TestCase):
     def setUp(self):
         self.client_id = str(uuid4())
         self.performer_ids = [str(uuid4()), str(uuid4())]
-        self.employee_ids = [int(uuid4().int % 1000000000), int(uuid4().int % 1000000000)]
+        self.person_ids = [int(uuid4().int % 1000000000), int(uuid4().int % 1000000000)]
         self.shift_id = str(uuid4())
         self.offer_ids = [str(uuid4()), str(uuid4())]
         self.campaign_id = str(uuid4())
         self.token_hashes = [uuid4().hex.ljust(64, "0"), uuid4().hex.ljust(64, "0")]
         now = datetime.now(timezone.utc)
-        self.storage.create_client({"id": self.client_id, "name": "storage-test", "external_id": None, "created_at": now})
-        for performer_id, employee_id in zip(self.performer_ids, self.employee_ids):
+        self.storage.create_client({"id": self.client_id, "name": "storage-test", "external_id": None, "client_type_code": "object", "parent_client_id": None, "created_at": now})
+        for performer_id, person_id in zip(self.performer_ids, self.person_ids):
             self.storage.sync_performer(
                 {
                     "id": performer_id,
-                    "employee_id": employee_id,
-                    "display_name": f"Storage Test {employee_id}",
+                    "person_id": person_id,
+                    "display_name": f"Storage Test {person_id}",
                     "email": None,
                     "phone": None,
                     "status": "active",
@@ -143,6 +143,62 @@ class OperationalStoragePostgresTest(unittest.TestCase):
             ).fetchone()["count"]
         self.assertEqual(assignment_count, 1)
         self.assertEqual(history_count, 1)
+
+
+    def test_person_event_ordering_and_merge(self):
+        from uuid import uuid4 as new_uuid
+
+        duplicate_person_id = int(new_uuid().int % 1000000000)
+        canonical_person_id = duplicate_person_id + 1
+
+        def envelope(version: int, aggregate_id: int, payload: dict, event_type: str = "people.performer_profile.changed") -> dict:
+            return {
+                "event_id": str(new_uuid()),
+                "event_type": event_type,
+                "schema_version": 1,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "aggregate_type": "person",
+                "aggregate_id": str(aggregate_id),
+                "aggregate_version": version,
+                "payload": payload,
+            }
+
+        try:
+            first = envelope(1, duplicate_person_id, {"person_id": str(duplicate_person_id), "profile_status": "active", "display_name": "Duplicate Person"})
+            self.assertEqual(self.storage.apply_person_event(first), "applied")
+            self.assertEqual(self.storage.apply_person_event(first), "duplicate")
+
+            gap = envelope(3, duplicate_person_id, {"person_id": str(duplicate_person_id), "profile_status": "active", "display_name": "Skipped"})
+            self.assertEqual(self.storage.apply_person_event(gap), "gap")
+            duplicate = self.storage.get_performer_by_person_id(duplicate_person_id)
+            self.assertEqual(duplicate["display_name"], "Duplicate Person")
+
+            second = envelope(2, duplicate_person_id, {"person_id": str(duplicate_person_id), "profile_status": "active", "display_name": "Renamed Person"})
+            self.assertEqual(self.storage.apply_person_event(second), "applied")
+            self.assertEqual(self.storage.get_performer_by_person_id(duplicate_person_id)["display_name"], "Renamed Person")
+            self.assertEqual(self.storage.apply_person_event(gap), "applied")
+
+            canonical_event = envelope(1, canonical_person_id, {"person_id": str(canonical_person_id), "profile_status": "active", "display_name": "Canonical Person"})
+            self.assertEqual(self.storage.apply_person_event(canonical_event), "applied")
+
+            merge_event = envelope(
+                4,
+                duplicate_person_id,
+                {"duplicate_person_id": str(duplicate_person_id), "canonical_person_id": str(canonical_person_id), "merged_at": datetime.now(timezone.utc).isoformat(), "reason_code": "verified_identifier_match"},
+                event_type="people.merged",
+            )
+            self.assertEqual(self.storage.apply_person_event(merge_event), "applied")
+            self.assertEqual(self.storage.apply_person_event(merge_event), "duplicate")
+
+            duplicate = self.storage.get_performer(duplicate["id"])
+            self.assertEqual(duplicate["status"], "merged")
+            canonical = self.storage.get_performer_by_person_id(canonical_person_id)
+            self.assertEqual(duplicate["merged_into_performer_id"], canonical["id"])
+        finally:
+            with self.storage.connection() as connection:
+                connection.execute("DELETE FROM person_event_inbox WHERE aggregate_id = ANY(%s)", ([duplicate_person_id, canonical_person_id],))
+                connection.execute("DELETE FROM person_consumer_state WHERE aggregate_id = ANY(%s)", ([duplicate_person_id, canonical_person_id],))
+                connection.execute("DELETE FROM performers WHERE person_id = ANY(%s)", ([duplicate_person_id, canonical_person_id],))
 
 
 if __name__ == "__main__":
