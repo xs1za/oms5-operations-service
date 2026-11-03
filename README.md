@@ -21,6 +21,7 @@
 - Предложения только исполнителям с подтверждённым типом и готовой стадией.
 - Транзакционный outbox публикует факты назначения и завершения в Kafka с повторной отправкой.
 - Табели и сводка по операционным данным.
+- Проверка пользовательских токенов через OMS1 и ролевой доступ к операциям операторов.
 
 ## Технологии
 
@@ -43,6 +44,10 @@
 - OMS2 владеет профилем исполнителя и персональными данными; OMS5 хранит операционную проекцию.
 - OMS1 владеет учетными записями, ролями, JWT и связью user -> person_id.
 - OMS4 владеет шаблонами уведомлений и доставкой email.
+
+## Доступ
+
+Защищенные операции оператора проверяют Bearer-токен через OMS1 и требуют роль manager, supervisor или administrator. Внешний пользователь создает смены только в рамках своей организации. Внутренняя синхронизация /performers/sync требует X-Service-Token от OMS2.
 
 ## Статусы смены
 
@@ -125,11 +130,15 @@ first accepted wins
 
 ## Интеграция Kafka и RabbitMQ
 
-Kafka передает доменные события operations.*. Факты воронки публикуются в operations.performer.v1 с ключом person_id через транзакционный outbox. Publisher повторяет отправку после сбоя Kafka.
+OMS5 принимает people.performer.v1 и обновляет локальную проекцию исполнителя.
 
-Факт назначения создается при accept. Факт завершения создается при переходе в A60_SETTLE или A80_CLOSED с close_reason=paid. Факт содержит часы и данные табеля. Событие operations.shift.performer_assigned сохранено для совместимости.
+Факты operations.shift.assigned и operations.shift.completed публикуются в operations.performer.v1 через транзакционный outbox PostgreSQL с ключом Kafka person_id. Фоновый publisher повторяет отправку после ошибки.
 
-RabbitMQ служит очередью фоновых команд соседних сервисов. OMS5 не выполняет email и report jobs напрямую.
+OMS5 публикует operations.shift.status_changed напрямую после транзакции смены, с ключом shift_id и без outbox. OMS3 и OMS4 читают событие в независимых группах потребителей.
+
+Остальные события OMS5 идут в отдельные топики с именами, совпадающими с event_type.
+
+RabbitMQ передает фоновые команды. OMS5 не выполняет email- и report-задачи.
 
 ## API
 
@@ -349,7 +358,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8005
 - `operations.shift.offer_won` - предложение победило.
 - `operations.shift.offer_lost` - предложение проиграло, смена уже занята.
 - `operations.shift.performer_assigned` - legacy-событие назначения, сохранено для совместимости.
-- `operations.shift.assigned` и `operations.shift.completed` - факты в topic `operations.performer.v1`, ключ — `person_id`.
+- `operations.shift.assigned` и `operations.shift.completed` - event_type values in topic `operations.performer.v1`, ключ — `person_id`.
 - `operations.timesheet.submitted` - табель отправлен.
 - `operations.shift.closed` - смена закрыта.
 
