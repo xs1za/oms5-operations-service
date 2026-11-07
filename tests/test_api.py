@@ -256,6 +256,26 @@ class OperationalApiTest(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 401)
         self.assertEqual(context.exception.detail["code"], "service_token_required")
 
+    def test_performer_read_endpoints_require_service_token(self):
+        from fastapi.routing import APIRoute
+
+        routes = {
+            route.path: route
+            for route in self.api.app.routes
+            if isinstance(route, APIRoute)
+        }
+        for path in ("/performers/by-person/{person_id}", "/performers/{performer_id}"):
+            dependency_calls = [dependency.call for dependency in routes[path].dependant.dependencies]
+            self.assertIn(self.api.require_service_token, dependency_calls)
+
+        for token in (None, "wrong"):
+            with self.assertRaises(HTTPException) as context:
+                self.api.require_service_token(token)
+            self.assertEqual(context.exception.status_code, 401)
+            self.assertEqual(context.exception.detail["code"], "service_token_required")
+            self.assertEqual(context.exception.detail["message"], "A valid service token is required")
+        self.assertIsNone(self.api.require_service_token("service-secret"))
+
     def test_performer_projection_is_returned_by_read_endpoints(self):
         by_person = self.api.get_performer_by_person(str(self.person_id))
         by_id = self.api.get_performer(self.performer_id)
@@ -266,9 +286,47 @@ class OperationalApiTest(unittest.TestCase):
             self.assertEqual(payload["medical_book_status"], "food")
             self.assertEqual(payload["completed_shifts_count"], 0)
             self.assertEqual(payload["person_id"], str(self.person_id))
-        with self.assertRaises(HTTPException) as missing:
+            self.assertTrue(payload["synced_at"].endswith("Z"))
+
+        with self.assertRaises(HTTPException) as missing_by_person:
             self.api.get_performer_by_person("999999999999")
+        self.assertEqual(missing_by_person.exception.status_code, 404)
+        self.assertEqual(missing_by_person.exception.detail["code"], "performer_not_found")
+        self.assertEqual(missing_by_person.exception.detail["message"], "Performer not found")
+
+        with self.assertRaises(HTTPException) as missing_by_id:
+            self.api.get_performer(str(uuid4()))
+        self.assertEqual(missing_by_id.exception.status_code, 404)
+        self.assertEqual(missing_by_id.exception.detail["code"], "performer_not_found")
+        self.assertEqual(missing_by_id.exception.detail["message"], "Performer not found")
+
+        with self.assertRaises(HTTPException) as invalid_uuid:
+            self.api.get_performer("not-a-uuid")
+        self.assertEqual(invalid_uuid.exception.status_code, 422)
+        self.assertEqual(invalid_uuid.exception.detail["code"], "invalid_uuid_format")
+        self.assertEqual(invalid_uuid.exception.detail["message"], "performer_id must be a UUID string")
+
+        with self.assertRaises(HTTPException) as invalid_person:
+            self.api.get_performer_by_person("12a")
+        self.assertEqual(invalid_person.exception.status_code, 422)
+        self.assertEqual(invalid_person.exception.detail["code"], "validation_error")
+        self.assertEqual(invalid_person.exception.detail["message"], "person_id must be a decimal BIGINT string")
+
+    def test_merged_performer_is_hidden_by_person_and_returned_by_id(self):
+        canonical_id, _ = self.create_performer("Canonical")
+        self.update_performer(
+            self.performer_id,
+            status="merged",
+            merged_into_performer_id=canonical_id,
+        )
+
+        with self.assertRaises(HTTPException) as missing:
+            self.api.get_performer_by_person(str(self.person_id))
         self.assertEqual(missing.exception.status_code, 404)
+        self.assertEqual(missing.exception.detail["code"], "performer_not_found")
+
+        merged = self.api.get_performer(self.performer_id)
+        self.assertEqual(merged["merged_into_performer_id"], canonical_id)
 
     def operator_principal(self) -> dict:
         return {

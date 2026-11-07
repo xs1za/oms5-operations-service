@@ -4,7 +4,7 @@ from hashlib import sha256
 import logging
 import os
 from secrets import token_urlsafe
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -628,22 +628,26 @@ def sync_performer(payload: PerformerSync, _: None = Depends(require_service_tok
 
 
 @app.get("/performers/by-person/{person_id}")
-def get_performer_by_person(person_id: str) -> dict:
+def get_performer_by_person(person_id: str, _: None = Depends(require_service_token)) -> dict:
     try:
         resolved = int(person_id)
     except (TypeError, ValueError):
         raise HTTPException(status_code=422, detail={"code": "validation_error", "message": "person_id must be a decimal BIGINT string"}) from None
     performer = storage.get_performer_by_person_id(resolved)
     if performer is None:
-        raise HTTPException(status_code=404, detail={"code": "performer_not_found"})
+        raise HTTPException(status_code=404, detail={"code": "performer_not_found", "message": "Performer not found"})
     return _performer_response(performer)
 
 
 @app.get("/performers/{performer_id}")
-def get_performer(performer_id: str) -> dict:
+def get_performer(performer_id: str, _: None = Depends(require_service_token)) -> dict:
+    try:
+        UUID(performer_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_uuid_format", "message": "performer_id must be a UUID string"}) from None
     performer = storage.get_performer(performer_id)
     if performer is None:
-        raise HTTPException(status_code=404, detail={"code": "performer_not_found"})
+        raise HTTPException(status_code=404, detail={"code": "performer_not_found", "message": "Performer not found"})
     return _performer_response(performer)
 
 

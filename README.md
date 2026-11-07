@@ -47,7 +47,7 @@
 
 ## Доступ
 
-Защищенные операции оператора проверяют Bearer-токен через OMS1 и требуют роль manager, supervisor или administrator. Внешний пользователь создает смены только в рамках своей организации. Внутренняя синхронизация /performers/sync требует X-Service-Token от OMS2.
+Защищенные операции оператора проверяют Bearer-токен через OMS1 и требуют роль manager, supervisor или administrator. Внешний пользователь создает смены только в рамках своей организации. Внутренняя синхронизация /performers/sync и чтение проекции исполнителя через GET /performers/by-person/{person_id} и GET /performers/{performer_id} требуют X-Service-Token от OMS2.
 
 ## Статусы смены
 
@@ -223,11 +223,14 @@ OMS5 получает профиль из topic people.performer.v1. POST /perfo
 }
 ```
 
-Поля проекции nullable для старых записей. Прочитать профиль можно по person_id или performer_id:
+Поля проекции nullable для старых записей. Прочитать профиль можно по person_id или performer_id. Оба GET внутренние: запрос должен содержать заголовок `X-Service-Token` со значением `OMS2_SERVICE_SECRET`.
 
 ```http
 GET /performers/by-person/{person_id}
+X-Service-Token: service token
+
 GET /performers/{performer_id}
+X-Service-Token: service token
 ```
 
 ### Создать кампанию предложений смены
