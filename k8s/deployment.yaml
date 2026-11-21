@@ -13,6 +13,25 @@ spec:
       labels:
         app: oms5
     spec:
+      initContainers:
+        - name: wait-postgres
+          image: oms5:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              python - <<'PY'
+              import socket
+              import time
+
+              for attempt in range(60):
+                  try:
+                      with socket.create_connection(("oms5-postgres", 5432), timeout=2):
+                          raise SystemExit(0)
+                  except OSError:
+                      time.sleep(2)
+              raise SystemExit(1)
+              PY
       containers:
         - name: oms5
           image: oms5:latest

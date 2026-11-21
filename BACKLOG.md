@@ -1,4 +1,4 @@
-# OMS5 Backlog
+# OMS5 backlog
 
 - Подготовить oms-portal-ui для public offer pages; OMS5 остается API-владельцем данных.
 - Подготовить личный кабинет исполнителя в oms-portal-ui после public offer pages.
