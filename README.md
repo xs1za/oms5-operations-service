@@ -415,7 +415,8 @@ http://localhost:8005/docs
 Это Swagger только текущего сервиса OMS5. Общая Swagger UI страница для единой спецификации `platform/contracts/openapi_oms_microservices.json` запускается отдельно из корня проекта и открывается без `/docs`:
 
 ```powershell
-docker run --rm `
+docker rm -f oms-swagger-ui 2>$null
+docker run -d --rm `
   --name oms-swagger-ui `
   -p 8088:8080 `
   -e SWAGGER_JSON=/spec/platform/contracts/openapi_oms_microservices.json `
@@ -427,7 +428,7 @@ docker run --rm `
 http://localhost:8088
 ```
 
-Через Ingress сервис доступен без port-forward. Встроенный Swagger UI OMS5:
+Через Gateway сервис доступен без port-forward. Встроенный Swagger UI OMS5:
 
 ```text
 http://oms.local/oms5/docs
